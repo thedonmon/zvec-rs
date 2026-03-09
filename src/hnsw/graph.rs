@@ -488,6 +488,80 @@ impl HnswIndex {
         })
     }
 
+    /// Get the current entry point, or None if the index is empty.
+    pub fn entry_point(&self) -> Option<u32> {
+        let ep = self.entry_point.load(Ordering::Acquire);
+        if ep == NO_ENTRY {
+            None
+        } else {
+            Some(ep)
+        }
+    }
+
+    /// Get the current maximum level.
+    pub fn max_level(&self) -> usize {
+        self.max_level.load(Ordering::Acquire)
+    }
+
+    /// Export connection lists for a single node (all layers).
+    /// Returns None if the internal_id is out of range.
+    pub fn get_connections(&self, internal_id: u32) -> Option<Vec<Vec<u32>>> {
+        self.nodes.with_nodes(|nodes| {
+            let idx = internal_id as usize;
+            if idx >= nodes.len() {
+                return None;
+            }
+            let node = &nodes[idx];
+            if node.is_deleted() {
+                return None;
+            }
+            let conns: Vec<Vec<u32>> = node
+                .connections
+                .iter()
+                .map(|c| c.read().clone())
+                .collect();
+            Some(conns)
+        })
+    }
+
+    /// Restore a node with pre-built connections (for loading from storage).
+    ///
+    /// This bypasses the normal insert path — no neighbor search is performed.
+    /// The caller is responsible for ensuring connections are consistent.
+    /// Nodes must be restored in internal_id order (0, 1, 2, ...).
+    pub fn restore_node(
+        &self,
+        external_id: u64,
+        vector: &[f32],
+        connections: Vec<Vec<u32>>,
+    ) -> u32 {
+        assert_eq!(vector.len(), self.dims, "vector dimension mismatch");
+
+        let level = connections.len().saturating_sub(1);
+        let node = Node::new(vector.to_vec(), level);
+
+        // Overwrite connection lists with stored data
+        for (i, conns) in connections.into_iter().enumerate() {
+            if i < node.connections.len() {
+                *node.connections[i].write() = conns;
+            }
+        }
+
+        let internal_id = self.nodes.push(node);
+
+        // Register in ID maps
+        self.id_map.write().insert(external_id, internal_id);
+        self.reverse_id_map.write().push(external_id);
+
+        internal_id
+    }
+
+    /// Set the entry point and max level directly (for loading from storage).
+    pub fn set_entry_point(&self, entry_point: u32, max_level: usize) {
+        self.entry_point.store(entry_point, Ordering::Release);
+        self.max_level.store(max_level, Ordering::Release);
+    }
+
     /// Get index statistics.
     pub fn stats(&self) -> HnswStats {
         let total = self.nodes.total_count();

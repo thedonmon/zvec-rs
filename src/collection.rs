@@ -112,12 +112,21 @@ impl Collection {
             return Ok(());
         }
 
+        // Load saved index state
+        let saved_state = storage.load_state()
+            .map_err(|e| format!("load state: {}", e))?;
+
         // Sort by internal ID to reconstruct pk_map in order
         let mut entries: Vec<(String, u32)> = id_map.into_iter().collect();
         entries.sort_by_key(|(_, id)| *id);
 
         let mut pk_map = self.pk_map.write().unwrap();
         let mut fields_map = self.fields.write().unwrap();
+
+        // Check if we have persisted connections (fast path)
+        let has_connections = entries.first().map_or(false, |(_, id)| {
+            storage.get_connections(*id, 0).ok().flatten().is_some()
+        });
 
         for (ext_id, internal_id) in &entries {
             // Ensure pk_map is filled up to this internal_id
@@ -131,12 +140,38 @@ impl Collection {
                 .map_err(|e| format!("load vector {}: {}", internal_id, e))?
                 .ok_or_else(|| format!("vector {} not found", internal_id))?;
 
-            self.index.insert(*internal_id as u64, &vector);
+            if has_connections {
+                // Fast path: restore node with saved connections
+                let mut connections = Vec::new();
+                for level in 0u8.. {
+                    match storage.get_connections(*internal_id, level) {
+                        Ok(Some(conns)) => connections.push(conns),
+                        _ => break,
+                    }
+                }
+                // Ensure at least one layer exists
+                if connections.is_empty() {
+                    connections.push(Vec::new());
+                }
+                self.index.restore_node(*internal_id as u64, &vector, connections);
+            } else {
+                // Slow path: re-insert (rebuilds graph from scratch)
+                self.index.insert(*internal_id as u64, &vector);
+            }
 
             // Load metadata
             if let Some(meta) = storage.get_metadata(*internal_id)
                 .map_err(|e| format!("load metadata {}: {}", internal_id, e))? {
                 fields_map.insert(ext_id.clone(), meta);
+            }
+        }
+
+        // Restore entry point and max level from saved state
+        if has_connections {
+            if let Some((entry_point, max_level, _)) = saved_state {
+                if entry_point != u32::MAX {
+                    self.index.set_entry_point(entry_point, max_level);
+                }
             }
         }
 
@@ -159,18 +194,19 @@ impl Collection {
             .unwrap()
             .insert(pk.to_string(), fields.clone());
 
-        // Persist to storage if configured
+        // Persist vector and metadata to storage (connections saved on flush)
         if let Some(ref storage_lock) = self.storage {
             if let Ok(storage) = storage_lock.read() {
-                // Get connections from the HNSW index for persistence
-                // For now, we persist vector + metadata. Full HNSW graph
-                // persistence would require exposing connection data.
+                let internal_id = numeric_id as u32;
+                // Get actual connections after insert
+                let conns = self.index.get_connections(internal_id)
+                    .unwrap_or_else(|| vec![vec![]]);
                 let _ = storage.put_vector(
-                    numeric_id as u32,
+                    internal_id,
                     pk,
                     vector,
                     &fields,
-                    &[vec![]], // connections stored separately on flush
+                    &conns,
                 );
             }
         }
@@ -274,10 +310,32 @@ impl Collection {
                 let mut storage = storage_lock.write()
                     .map_err(|e| format!("storage lock: {}", e))?;
 
-                // Save index state
-                let next_id = self.pk_map.read().unwrap().len() as u32;
-                let stats = self.index.stats();
-                storage.save_state(0, stats.max_level, next_id)
+                // Persist connections for all active nodes
+                let pk_map = self.pk_map.read().unwrap();
+                let fields_map = self.fields.read().unwrap();
+                for (idx, pk) in pk_map.iter().enumerate() {
+                    if pk.is_empty() {
+                        continue;
+                    }
+                    let internal_id = idx as u32;
+                    if let Some(conns) = self.index.get_connections(internal_id) {
+                        // Get vector from the index
+                        let ext_id = idx as u64;
+                        if let Some(vector) = self.index.get_vector(ext_id) {
+                            let fields = fields_map.get(pk)
+                                .cloned()
+                                .unwrap_or_default();
+                            storage.put_vector(internal_id, pk, &vector, &fields, &conns)
+                                .map_err(|e| format!("persist node {}: {}", pk, e))?;
+                        }
+                    }
+                }
+
+                // Save index state with correct entry point
+                let next_id = pk_map.len() as u32;
+                let entry_point = self.index.entry_point().unwrap_or(u32::MAX);
+                let max_level = self.index.max_level();
+                storage.save_state(entry_point, max_level, next_id)
                     .map_err(|e| format!("save state: {}", e))?;
 
                 storage.flush()
@@ -537,6 +595,82 @@ mod tests {
             assert_eq!(col.doc_count(), 1);
             assert!(col.fetch("doc-1").is_none());
             assert!(col.fetch("doc-2").is_some());
+        }
+    }
+
+    #[test]
+    fn test_persistent_graph_topology() {
+        // Verify that graph connections survive a flush/reload cycle
+        let dir = tempfile::tempdir().unwrap();
+        let dims = 8;
+        let config = CollectionConfig::new(dims).with_metric(MetricType::L2);
+
+        let mut rng = rand::thread_rng();
+        let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
+        for i in 0..20 {
+            let v: Vec<f32> = (0..dims).map(|_| rng.gen()).collect();
+            vectors.push((format!("doc-{}", i), v));
+        }
+        let query: Vec<f32> = (0..dims).map(|_| rng.gen()).collect();
+
+        // Insert and get search results before flush
+        let results_before;
+        {
+            let col = Collection::open(dir.path(), "test", config.clone()).unwrap();
+            for (pk, v) in &vectors {
+                col.upsert(pk, v, test_fields("a", "t1"));
+            }
+            results_before = col.search(&query, 5, None).unwrap();
+            col.flush().unwrap();
+        }
+
+        // Reopen and verify search results match (same graph topology)
+        {
+            let col = Collection::open(dir.path(), "test", config.clone()).unwrap();
+            assert_eq!(col.doc_count(), 20);
+            let results_after = col.search(&query, 5, None).unwrap();
+
+            // Results should be identical since graph was restored, not rebuilt
+            assert_eq!(results_before.len(), results_after.len());
+            for (a, b) in results_before.iter().zip(results_after.iter()) {
+                assert_eq!(a.pk, b.pk, "search result order changed after reload");
+            }
+        }
+    }
+
+    #[test]
+    fn test_persistent_upsert_after_reload() {
+        // Verify we can upsert new docs after reloading from disk
+        let dir = tempfile::tempdir().unwrap();
+        let dims = 4;
+        let config = CollectionConfig::new(dims).with_metric(MetricType::L2);
+
+        {
+            let col = Collection::open(dir.path(), "test", config.clone()).unwrap();
+            col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+            col.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+            col.flush().unwrap();
+        }
+
+        {
+            let col = Collection::open(dir.path(), "test", config.clone()).unwrap();
+            assert_eq!(col.doc_count(), 2);
+            // Insert more after reload
+            col.upsert("doc-3", &[0.0, 0.0, 1.0, 0.0], test_fields("c", "t1"));
+            col.upsert("doc-4", &[0.0, 0.0, 0.0, 1.0], test_fields("d", "t1"));
+            assert_eq!(col.doc_count(), 4);
+
+            let results = col.search(&[0.0, 0.0, 1.0, 0.0], 1, None).unwrap();
+            assert_eq!(results[0].pk, "doc-3");
+            col.flush().unwrap();
+        }
+
+        // Verify everything persisted
+        {
+            let col = Collection::open(dir.path(), "test", config).unwrap();
+            assert_eq!(col.doc_count(), 4);
+            let f = col.fetch("doc-4").unwrap();
+            assert_eq!(f["category"], "d");
         }
     }
 
