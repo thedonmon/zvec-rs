@@ -346,6 +346,12 @@ impl Collection {
         }
     }
 
+    /// Optimize the collection: flush to disk and compact the database.
+    /// For in-memory collections, this is a no-op.
+    pub fn optimize(&self) -> Result<bool, String> {
+        self.flush()
+    }
+
     /// Get the number of documents in the collection.
     pub fn doc_count(&self) -> usize {
         self.index.len()
