@@ -6,7 +6,9 @@
 mod graph;
 mod params;
 mod search;
+pub mod sparse;
 
-pub use graph::{HnswIndex, HnswStats};
+pub use graph::{HnswDetailedStats, HnswIndex, HnswLevelStats, HnswStats};
 pub use params::HnswParams;
 pub use search::SearchResult;
+pub use sparse::{SparseHnswIndex, SparseMetric};

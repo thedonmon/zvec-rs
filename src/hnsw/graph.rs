@@ -761,6 +761,80 @@ impl HnswIndex {
             dims: self.dims,
         }
     }
+
+    pub fn detailed_stats(&self) -> HnswDetailedStats {
+        let total = self.nodes.total_count();
+        let active = self.id_map.read().len();
+        let max_level = self.max_level.load(Ordering::Relaxed);
+        let entry_point = self.entry_point();
+
+        let mut level_stats: Vec<HnswLevelStats> = Vec::new();
+
+        self.nodes.with_nodes(|nodes| {
+            for level in 0..=max_level {
+                let mut node_count = 0usize;
+                let mut total_connections = 0usize;
+                let mut min_connections = usize::MAX;
+                let mut max_connections = 0usize;
+                let mut histogram: std::collections::BTreeMap<usize, usize> =
+                    std::collections::BTreeMap::new();
+
+                for node in nodes.iter() {
+                    if node.is_deleted() {
+                        continue;
+                    }
+                    if level < node.connections.len() {
+                        let conns = node.connections[level].read();
+                        let count = conns.len();
+                        node_count += 1;
+                        total_connections += count;
+                        if count < min_connections {
+                            min_connections = count;
+                        }
+                        if count > max_connections {
+                            max_connections = count;
+                        }
+                        *histogram.entry(count).or_insert(0) += 1;
+                    }
+                }
+
+                if node_count == 0 {
+                    min_connections = 0;
+                }
+
+                let avg_connections = if node_count > 0 {
+                    total_connections as f64 / node_count as f64
+                } else {
+                    0.0
+                };
+
+                level_stats.push(HnswLevelStats {
+                    level,
+                    node_count,
+                    avg_connections,
+                    min_connections,
+                    max_connections,
+                    connection_histogram: histogram,
+                });
+            }
+        });
+
+        HnswDetailedStats {
+            total_nodes: total,
+            active_nodes: active,
+            deleted_nodes: total - active,
+            max_level,
+            dims: self.dims,
+            entry_point,
+            metric: self.metric,
+            level_stats,
+        }
+    }
+
+    /// Get the metric type used by this index.
+    pub fn metric(&self) -> MetricType {
+        self.metric
+    }
 }
 
 /// Statistics about the HNSW index.
@@ -771,6 +845,58 @@ pub struct HnswStats {
     pub deleted_nodes: usize,
     pub max_level: usize,
     pub dims: usize,
+}
+
+/// Detailed statistics about the HNSW index, including per-level info.
+#[derive(Debug, Clone)]
+pub struct HnswDetailedStats {
+    pub total_nodes: usize,
+    pub active_nodes: usize,
+    pub deleted_nodes: usize,
+    pub max_level: usize,
+    pub dims: usize,
+    pub entry_point: Option<u32>,
+    pub metric: MetricType,
+    pub level_stats: Vec<HnswLevelStats>,
+}
+
+/// Per-level statistics for an HNSW index.
+#[derive(Debug, Clone)]
+pub struct HnswLevelStats {
+    pub level: usize,
+    pub node_count: usize,
+    pub avg_connections: f64,
+    pub min_connections: usize,
+    pub max_connections: usize,
+    /// Histogram: connection_count -> number of nodes with that count.
+    pub connection_histogram: std::collections::BTreeMap<usize, usize>,
+}
+
+impl std::fmt::Display for HnswDetailedStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "HNSW Index Stats:")?;
+        writeln!(f, "  Dimensions:    {}", self.dims)?;
+        writeln!(f, "  Metric:        {:?}", self.metric)?;
+        writeln!(f, "  Total nodes:   {}", self.total_nodes)?;
+        writeln!(f, "  Active nodes:  {}", self.active_nodes)?;
+        writeln!(f, "  Deleted nodes: {}", self.deleted_nodes)?;
+        writeln!(f, "  Max level:     {}", self.max_level)?;
+        writeln!(
+            f,
+            "  Entry point:   {}",
+            self.entry_point
+                .map(|ep| ep.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )?;
+        for ls in &self.level_stats {
+            writeln!(
+                f,
+                "  Level {}: {} nodes, avg {:.1} connections (min {}, max {})",
+                ls.level, ls.node_count, ls.avg_connections, ls.min_connections, ls.max_connections
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

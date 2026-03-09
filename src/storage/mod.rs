@@ -1,60 +1,20 @@
-//! Persistent storage backed by redb (pure Rust embedded KV store).
+//! Pluggable storage backends for zvec-rs.
 //!
-//! Storage layout:
+//! Storage layout (for persistent backends):
 //! - `vectors` table: internal_id (u32) -> raw f32 bytes
 //! - `metadata` table: internal_id (u32) -> JSON-encoded field map
 //! - `id_map` table: external_id (string) -> internal_id (u32)
 //! - `state` table: "entry_point", "max_level", "next_id" -> u64 values
 
+mod redb_backend;
+mod memory_backend;
+
+pub use redb_backend::RedbBackend;
+pub use memory_backend::InMemoryBackend;
+
+use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
-
-use redb::{Database, ReadableTable, TableDefinition};
-
-const VECTORS: TableDefinition<u32, &[u8]> = TableDefinition::new("vectors");
-const METADATA: TableDefinition<u32, &str> = TableDefinition::new("metadata");
-const ID_MAP: TableDefinition<&str, u32> = TableDefinition::new("id_map");
-const CONNECTIONS: TableDefinition<(u32, u8), &[u8]> =
-    TableDefinition::new("connections");
-const STATE: TableDefinition<&str, u64> = TableDefinition::new("state");
-
-/// Convert &[f32] to Vec<u8> (safe, no alignment issues).
-fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &val in data {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
-}
-
-/// Convert &[u8] back to Vec<f32> (safe, handles unaligned data).
-fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
-
-/// Convert &[u32] to Vec<u8> (safe).
-fn u32_slice_to_bytes(data: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &val in data {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
-}
-
-/// Convert &[u8] back to Vec<u32> (safe, handles unaligned data).
-fn bytes_to_u32_vec(bytes: &[u8]) -> Vec<u32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
-
-/// Persistent storage engine using redb.
-pub struct Storage {
-    db: Database,
-}
 
 /// Error type for storage operations.
 #[derive(Debug)]
@@ -66,6 +26,7 @@ pub enum StorageError {
     Storage(redb::StorageError),
     Commit(redb::CommitError),
     Serde(serde_json::Error),
+    Other(String),
 }
 
 impl From<redb::Error> for StorageError {
@@ -110,8 +71,8 @@ impl From<serde_json::Error> for StorageError {
     }
 }
 
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StorageError::Redb(e) => write!(f, "redb error: {e}"),
             StorageError::Database(e) => write!(f, "database error: {e}"),
@@ -120,252 +81,200 @@ impl std::fmt::Display for StorageError {
             StorageError::Storage(e) => write!(f, "storage error: {e}"),
             StorageError::Commit(e) => write!(f, "commit error: {e}"),
             StorageError::Serde(e) => write!(f, "serde error: {e}"),
+            StorageError::Other(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for StorageError {}
 
+/// Trait defining the storage backend interface.
+///
+/// All methods mirror the original `Storage` API so that backends are
+/// drop-in replacements for each other.
+pub trait StorageBackend {
+    /// Store a vector with its metadata and connections.
+    fn put_vector(
+        &self,
+        internal_id: u32,
+        external_id: &str,
+        vector: &[f32],
+        fields: &HashMap<String, String>,
+        connections: &[Vec<u32>],
+    ) -> Result<(), StorageError>;
+
+    /// Remove a vector by external ID. Returns the internal ID if found.
+    fn remove_vector(&self, external_id: &str) -> Result<Option<u32>, StorageError>;
+
+    /// Load a vector by internal ID.
+    fn get_vector(&self, internal_id: u32) -> Result<Option<Vec<f32>>, StorageError>;
+
+    /// Load metadata for a vector.
+    fn get_metadata(
+        &self,
+        internal_id: u32,
+    ) -> Result<Option<HashMap<String, String>>, StorageError>;
+
+    /// Load connections for a node at a specific layer.
+    fn get_connections(
+        &self,
+        internal_id: u32,
+        level: u8,
+    ) -> Result<Option<Vec<u32>>, StorageError>;
+
+    /// Save index state (entry point, max level, next ID).
+    fn save_state(
+        &self,
+        entry_point: u32,
+        max_level: usize,
+        next_id: u32,
+    ) -> Result<(), StorageError>;
+
+    /// Load index state.
+    fn load_state(&self) -> Result<Option<(u32, usize, u32)>, StorageError>;
+
+    /// Get all external ID -> internal ID mappings.
+    fn load_id_map(&self) -> Result<HashMap<String, u32>, StorageError>;
+
+    /// Save the schema JSON string.
+    fn save_schema(&self, schema_json: &str) -> Result<(), StorageError>;
+
+    /// Load the schema JSON string.
+    fn load_schema(&self) -> Result<Option<String>, StorageError>;
+
+    /// Store multiple vectors in a single transaction (batch).
+    fn put_vectors_batch(
+        &self,
+        items: &[(u32, &str, &[f32], &HashMap<String, String>, &[Vec<u32>])],
+    ) -> Result<(), StorageError>;
+
+    /// Flush all pending writes to disk (no-op for in-memory backends).
+    fn flush(&mut self) -> Result<(), StorageError>;
+
+    /// Return the backend type name (for diagnostics).
+    fn backend_type(&self) -> &'static str;
+
+    /// Return the approximate size in bytes on disk, if applicable.
+    fn disk_size(&self) -> Option<u64>;
+}
+
+/// The storage engine, wrapping a pluggable backend.
+///
+/// By default, uses `RedbBackend` for persistent storage. Use
+/// `Storage::in_memory()` for a purely in-memory backend.
+pub enum Storage {
+    Redb(RedbBackend),
+    InMemory(InMemoryBackend),
+}
+
 impl Storage {
-    /// Open or create a database at the given path.
+    /// Open or create a persistent (redb) database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let db = Database::create(path.as_ref())?;
-
-        // Create tables on first open
-        let txn = db.begin_write()?;
-        {
-            let _ = txn.open_table(VECTORS)?;
-            let _ = txn.open_table(METADATA)?;
-            let _ = txn.open_table(ID_MAP)?;
-            let _ = txn.open_table(CONNECTIONS)?;
-            let _ = txn.open_table(STATE)?;
-        }
-        txn.commit()?;
-
-        Ok(Self { db })
+        Ok(Storage::Redb(RedbBackend::open(path)?))
     }
 
-    /// Store a vector with its metadata and connections.
+    /// Create a new in-memory storage backend.
+    pub fn in_memory() -> Self {
+        Storage::InMemory(InMemoryBackend::new())
+    }
+
+    /// Get a reference to the underlying backend as a trait object.
+    fn backend(&self) -> &dyn StorageBackend {
+        match self {
+            Storage::Redb(b) => b,
+            Storage::InMemory(b) => b,
+        }
+    }
+
+    /// Get a mutable reference to the underlying backend.
+    fn backend_mut(&mut self) -> &mut dyn StorageBackend {
+        match self {
+            Storage::Redb(b) => b,
+            Storage::InMemory(b) => b,
+        }
+    }
+
+    // --- Delegate all methods to the backend ---
+
     pub fn put_vector(
         &self,
         internal_id: u32,
         external_id: &str,
         vector: &[f32],
-        fields: &std::collections::HashMap<String, String>,
+        fields: &HashMap<String, String>,
         connections: &[Vec<u32>],
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            // Store vector as raw bytes (safe copy via bytemuck-style conversion)
-            let vector_bytes = f32_slice_to_bytes(vector);
-            let mut vectors_table = txn.open_table(VECTORS)?;
-            vectors_table.insert(internal_id, vector_bytes.as_slice())?;
-
-            // Store metadata as JSON
-            let meta_json = serde_json::to_string(fields)?;
-            let mut meta_table = txn.open_table(METADATA)?;
-            meta_table.insert(internal_id, meta_json.as_str())?;
-
-            // Store ID mapping
-            let mut id_table = txn.open_table(ID_MAP)?;
-            id_table.insert(external_id, internal_id)?;
-
-            // Store connections per layer
-            let mut conn_table = txn.open_table(CONNECTIONS)?;
-            for (level, conns) in connections.iter().enumerate() {
-                let conn_bytes = u32_slice_to_bytes(conns);
-                conn_table.insert((internal_id, level as u8), conn_bytes.as_slice())?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
+        self.backend()
+            .put_vector(internal_id, external_id, vector, fields, connections)
     }
 
-    /// Remove a vector by external ID.
     pub fn remove_vector(&self, external_id: &str) -> Result<Option<u32>, StorageError> {
-        let txn = self.db.begin_write()?;
-        let internal_id;
-        {
-            let mut id_table = txn.open_table(ID_MAP)?;
-            internal_id = match id_table.remove(external_id)? {
-                Some(v) => v.value(),
-                None => return Ok(None),
-            };
-
-            let mut vectors_table = txn.open_table(VECTORS)?;
-            vectors_table.remove(internal_id)?;
-
-            let mut meta_table = txn.open_table(METADATA)?;
-            meta_table.remove(internal_id)?;
-
-            // Remove all connection layers
-            let mut conn_table = txn.open_table(CONNECTIONS)?;
-            for level in 0..=255u8 {
-                if conn_table.remove((internal_id, level))?.is_none() {
-                    break;
-                }
-            }
-        }
-        txn.commit()?;
-        Ok(Some(internal_id))
+        self.backend().remove_vector(external_id)
     }
 
-    /// Load a vector by internal ID.
     pub fn get_vector(&self, internal_id: u32) -> Result<Option<Vec<f32>>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(VECTORS)?;
-        match table.get(internal_id)? {
-            Some(bytes) => Ok(Some(bytes_to_f32_vec(bytes.value()))),
-            None => Ok(None),
-        }
+        self.backend().get_vector(internal_id)
     }
 
-    /// Load metadata for a vector.
     pub fn get_metadata(
         &self,
         internal_id: u32,
-    ) -> Result<Option<std::collections::HashMap<String, String>>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(METADATA)?;
-        match table.get(internal_id)? {
-            Some(json_str) => {
-                let fields = serde_json::from_str(json_str.value())?;
-                Ok(Some(fields))
-            }
-            None => Ok(None),
-        }
+    ) -> Result<Option<HashMap<String, String>>, StorageError> {
+        self.backend().get_metadata(internal_id)
     }
 
-    /// Load connections for a node at a specific layer.
     pub fn get_connections(
         &self,
         internal_id: u32,
         level: u8,
     ) -> Result<Option<Vec<u32>>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(CONNECTIONS)?;
-        match table.get((internal_id, level))? {
-            Some(bytes) => Ok(Some(bytes_to_u32_vec(bytes.value()))),
-            None => Ok(None),
-        }
+        self.backend().get_connections(internal_id, level)
     }
 
-    /// Save index state (entry point, max level, next ID).
     pub fn save_state(
         &self,
         entry_point: u32,
         max_level: usize,
         next_id: u32,
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(STATE)?;
-            table.insert("entry_point", entry_point as u64)?;
-            table.insert("max_level", max_level as u64)?;
-            table.insert("next_id", next_id as u64)?;
-        }
-        txn.commit()?;
-        Ok(())
+        self.backend().save_state(entry_point, max_level, next_id)
     }
 
-    /// Load index state.
     pub fn load_state(&self) -> Result<Option<(u32, usize, u32)>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(STATE)?;
-
-        let entry_point = match table.get("entry_point")? {
-            Some(v) => v.value() as u32,
-            None => return Ok(None),
-        };
-        let max_level = match table.get("max_level")? {
-            Some(v) => v.value() as usize,
-            None => return Ok(None),
-        };
-        let next_id = match table.get("next_id")? {
-            Some(v) => v.value() as u32,
-            None => return Ok(None),
-        };
-
-        Ok(Some((entry_point, max_level, next_id)))
+        self.backend().load_state()
     }
 
-    /// Get all external ID -> internal ID mappings.
-    pub fn load_id_map(&self) -> Result<std::collections::HashMap<String, u32>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(ID_MAP)?;
-        let mut map = std::collections::HashMap::new();
-        let iter = table.iter()?;
-        for entry in iter {
-            let entry = entry?;
-            map.insert(entry.0.value().to_string(), entry.1.value());
-        }
-        Ok(map)
+    pub fn load_id_map(&self) -> Result<HashMap<String, u32>, StorageError> {
+        self.backend().load_id_map()
     }
 
-    /// Save the schema JSON string.
     pub fn save_schema(&self, schema_json: &str) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let table = txn.open_table(STATE)?;
-            // Store schema as a u64-keyed entry won't work since STATE is &str->u64.
-            // Use METADATA table with a sentinel key instead.
-            drop(table);
-            let mut meta = txn.open_table(METADATA)?;
-            // Use internal_id u32::MAX as sentinel for schema storage
-            meta.insert(u32::MAX, schema_json)?;
-        }
-        txn.commit()?;
-        Ok(())
+        self.backend().save_schema(schema_json)
     }
 
-    /// Load the schema JSON string.
     pub fn load_schema(&self) -> Result<Option<String>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(METADATA)?;
-        match table.get(u32::MAX)? {
-            Some(v) => Ok(Some(v.value().to_string())),
-            None => Ok(None),
-        }
+        self.backend().load_schema()
     }
 
-    /// Store multiple vectors in a single transaction (batch).
     pub fn put_vectors_batch(
         &self,
-        items: &[(u32, &str, &[f32], &std::collections::HashMap<String, String>, &[Vec<u32>])],
+        items: &[(u32, &str, &[f32], &HashMap<String, String>, &[Vec<u32>])],
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut vectors_table = txn.open_table(VECTORS)?;
-            let mut meta_table = txn.open_table(METADATA)?;
-            let mut id_table = txn.open_table(ID_MAP)?;
-            let mut conn_table = txn.open_table(CONNECTIONS)?;
-
-            for &(internal_id, external_id, vector, fields, connections) in items {
-                let vector_bytes = f32_slice_to_bytes(vector);
-                vectors_table.insert(internal_id, vector_bytes.as_slice())?;
-
-                let meta_json = serde_json::to_string(fields)?;
-                meta_table.insert(internal_id, meta_json.as_str())?;
-
-                id_table.insert(external_id, internal_id)?;
-
-                for (level, conns) in connections.iter().enumerate() {
-                    let conn_bytes = u32_slice_to_bytes(conns);
-                    conn_table.insert((internal_id, level as u8), conn_bytes.as_slice())?;
-                }
-            }
-        }
-        txn.commit()?;
-        Ok(())
+        self.backend().put_vectors_batch(items)
     }
 
-    /// Flush all pending writes to disk.
     pub fn flush(&mut self) -> Result<(), StorageError> {
-        // redb commits are durable by default, but we can compact
-        self.db
-            .compact()
-            .map_err(|e| StorageError::Redb(redb::Error::from(e)))?;
-        Ok(())
+        self.backend_mut().flush()
+    }
+
+    /// Return the backend type name.
+    pub fn backend_type(&self) -> &'static str {
+        self.backend().backend_type()
+    }
+
+    /// Return approximate disk size in bytes, if applicable.
+    pub fn disk_size(&self) -> Option<u64> {
+        self.backend().disk_size()
     }
 }
 
@@ -373,13 +282,10 @@ impl Storage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_roundtrip_vector() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
-
+    /// Run a standard test suite against any storage backend.
+    fn test_roundtrip_vector_on(storage: Storage) {
         let vector = vec![1.0f32, 2.0, 3.0, 4.0];
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = HashMap::new();
         fields.insert("title".to_string(), "hello".to_string());
         let connections = vec![vec![1, 2, 3], vec![4, 5]];
 
@@ -387,7 +293,6 @@ mod tests {
             .put_vector(0, "doc-1", &vector, &fields, &connections)
             .unwrap();
 
-        // Read back
         let loaded = storage.get_vector(0).unwrap().unwrap();
         assert_eq!(loaded, vector);
 
@@ -401,12 +306,8 @@ mod tests {
         assert_eq!(conns, vec![4, 5]);
     }
 
-    #[test]
-    fn test_remove_vector() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
-
-        let fields = std::collections::HashMap::new();
+    fn test_remove_vector_on(storage: Storage) {
+        let fields = HashMap::new();
         storage
             .put_vector(0, "doc-1", &[1.0, 2.0], &fields, &[vec![]])
             .unwrap();
@@ -418,11 +319,7 @@ mod tests {
         assert!(storage.remove_vector("doc-1").unwrap().is_none());
     }
 
-    #[test]
-    fn test_state_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
-
+    fn test_state_roundtrip_on(storage: Storage) {
         storage.save_state(42, 3, 100).unwrap();
 
         let (ep, ml, next) = storage.load_state().unwrap().unwrap();
@@ -431,12 +328,8 @@ mod tests {
         assert_eq!(next, 100);
     }
 
-    #[test]
-    fn test_id_map() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
-
-        let fields = std::collections::HashMap::new();
+    fn test_id_map_on(storage: Storage) {
+        let fields = HashMap::new();
         storage
             .put_vector(0, "doc-a", &[1.0], &fields, &[vec![]])
             .unwrap();
@@ -450,21 +343,88 @@ mod tests {
         assert_eq!(map["doc-b"], 1);
     }
 
+    fn test_schema_roundtrip_on(storage: Storage) {
+        let schema_json = r#"[{"name":"category","type":"filtered"}]"#;
+        storage.save_schema(schema_json).unwrap();
+        let loaded = storage.load_schema().unwrap().unwrap();
+        assert_eq!(loaded, schema_json);
+    }
+
+    fn test_batch_on(storage: Storage) {
+        let fields1 = HashMap::new();
+        let fields2 = HashMap::new();
+        let conns1 = vec![vec![1]];
+        let conns2 = vec![vec![0]];
+        let items: Vec<(u32, &str, &[f32], &HashMap<String, String>, &[Vec<u32>])> = vec![
+            (0, "a", &[1.0, 2.0], &fields1, &conns1),
+            (1, "b", &[3.0, 4.0], &fields2, &conns2),
+        ];
+        storage.put_vectors_batch(&items).unwrap();
+
+        assert_eq!(storage.get_vector(0).unwrap().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(storage.get_vector(1).unwrap().unwrap(), vec![3.0, 4.0]);
+        let map = storage.load_id_map().unwrap();
+        assert_eq!(map.len(), 2);
+    }
+
+    // --- Redb tests ---
+
     #[test]
-    fn test_persistence_across_opens() {
+    fn test_redb_roundtrip_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        test_roundtrip_vector_on(storage);
+    }
+
+    #[test]
+    fn test_redb_remove_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        test_remove_vector_on(storage);
+    }
+
+    #[test]
+    fn test_redb_state_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        test_state_roundtrip_on(storage);
+    }
+
+    #[test]
+    fn test_redb_id_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        test_id_map_on(storage);
+    }
+
+    #[test]
+    fn test_redb_schema_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        test_schema_roundtrip_on(storage);
+    }
+
+    #[test]
+    fn test_redb_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        test_batch_on(storage);
+    }
+
+    #[test]
+    fn test_redb_persistence_across_opens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
 
         {
             let storage = Storage::open(&path).unwrap();
-            let fields = std::collections::HashMap::new();
+            let fields = HashMap::new();
             storage
                 .put_vector(0, "doc-1", &[1.0, 2.0, 3.0], &fields, &[vec![1]])
                 .unwrap();
             storage.save_state(0, 1, 1).unwrap();
         }
 
-        // Reopen
         let storage = Storage::open(&path).unwrap();
         let v = storage.get_vector(0).unwrap().unwrap();
         assert_eq!(v, vec![1.0, 2.0, 3.0]);
@@ -473,5 +433,63 @@ mod tests {
         assert_eq!(ep, 0);
         assert_eq!(ml, 1);
         assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn test_redb_backend_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        assert_eq!(storage.backend_type(), "redb");
+    }
+
+    #[test]
+    fn test_redb_disk_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
+        assert!(storage.disk_size().is_some());
+    }
+
+    // --- InMemory tests ---
+
+    #[test]
+    fn test_memory_roundtrip_vector() {
+        test_roundtrip_vector_on(Storage::in_memory());
+    }
+
+    #[test]
+    fn test_memory_remove_vector() {
+        test_remove_vector_on(Storage::in_memory());
+    }
+
+    #[test]
+    fn test_memory_state_roundtrip() {
+        test_state_roundtrip_on(Storage::in_memory());
+    }
+
+    #[test]
+    fn test_memory_id_map() {
+        test_id_map_on(Storage::in_memory());
+    }
+
+    #[test]
+    fn test_memory_schema_roundtrip() {
+        test_schema_roundtrip_on(Storage::in_memory());
+    }
+
+    #[test]
+    fn test_memory_batch() {
+        test_batch_on(Storage::in_memory());
+    }
+
+    #[test]
+    fn test_memory_backend_type() {
+        let storage = Storage::in_memory();
+        assert_eq!(storage.backend_type(), "memory");
+    }
+
+    #[test]
+    fn test_memory_disk_size() {
+        let storage = Storage::in_memory();
+        assert!(storage.disk_size().is_none());
     }
 }

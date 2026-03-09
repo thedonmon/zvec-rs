@@ -10,7 +10,7 @@ use std::sync::RwLock;
 
 use crate::distance::MetricType;
 use crate::filter::{self, parse_filter, FilterExpr};
-use crate::hnsw::{HnswIndex, HnswParams};
+use crate::hnsw::{HnswDetailedStats, HnswIndex, HnswParams};
 use crate::schema::{FieldSchema, FieldType};
 use crate::storage::Storage;
 
@@ -335,13 +335,69 @@ pub struct GroupByResult {
     pub hits: Vec<SearchHit>,
 }
 
+/// Comprehensive diagnostics about a collection.
+#[derive(Debug, Clone)]
+pub struct CollectionDiagnostics {
+    pub total_vectors: usize,
+    pub dimensions: usize,
+    pub metric: MetricType,
+    pub hnsw_stats: HnswDetailedStats,
+    pub storage_backend: String,
+    pub disk_size: Option<u64>,
+    pub schema_field_count: usize,
+    pub schema_indexed_field_count: usize,
+    pub schema_fields: Vec<(String, String)>,
+    pub inverted_index_stats: InvertedIndexStats,
+}
+
+/// Statistics about the inverted index.
+#[derive(Debug, Clone)]
+pub struct InvertedIndexStats {
+    pub indexed_field_count: usize,
+    pub total_terms: usize,
+    pub avg_posting_list_size: f64,
+    pub max_posting_list_size: usize,
+}
+
+impl std::fmt::Display for CollectionDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Collection Diagnostics")?;
+        writeln!(f, "======================")?;
+        writeln!(f, "Vectors:     {}", self.total_vectors)?;
+        writeln!(f, "Dimensions:  {}", self.dimensions)?;
+        writeln!(f, "Metric:      {:?}", self.metric)?;
+        writeln!(f)?;
+        write!(f, "{}", self.hnsw_stats)?;
+        writeln!(f)?;
+        writeln!(f, "Storage:")?;
+        writeln!(f, "  Backend: {}", self.storage_backend)?;
+        if let Some(size) = self.disk_size {
+            writeln!(f, "  Disk size: {} bytes", size)?;
+        }
+        writeln!(f)?;
+        writeln!(f, "Schema:")?;
+        writeln!(f, "  Total fields:   {}", self.schema_field_count)?;
+        writeln!(f, "  Indexed fields: {}", self.schema_indexed_field_count)?;
+        for (name, ft) in &self.schema_fields {
+            writeln!(f, "  - {} ({})", name, ft)?;
+        }
+        writeln!(f)?;
+        writeln!(f, "Inverted Index:")?;
+        writeln!(f, "  Indexed fields:         {}", self.inverted_index_stats.indexed_field_count)?;
+        writeln!(f, "  Total terms:            {}", self.inverted_index_stats.total_terms)?;
+        writeln!(f, "  Avg posting list size:  {:.1}", self.inverted_index_stats.avg_posting_list_size)?;
+        writeln!(f, "  Max posting list size:  {}", self.inverted_index_stats.max_posting_list_size)?;
+        Ok(())
+    }
+}
+
 /// A vector collection with HNSW index, metadata, inverted index, and field storage.
 ///
 /// Thread-safe: supports concurrent inserts and searches.
 pub struct Collection {
     index: HnswIndex,
     /// pk (String) -> field values
-    fields: RwLock<HashMap<String, HashMap<String, String>>>,
+    pub(crate) fields: RwLock<HashMap<String, HashMap<String, String>>>,
     /// Internal ID -> pk
     pk_map: RwLock<Vec<String>>,
     /// Inverted index for filtered/tags fields
@@ -989,6 +1045,97 @@ impl Collection {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Merge Operations
+    // -----------------------------------------------------------------------
+
+    /// Merge all documents from `other` into `self`.
+    ///
+    /// Overwrite semantics: if a document with the same primary key exists in
+    /// both collections, the version from `other` wins.
+    ///
+    /// **Note:** Both collections must have the same dimensionality and metric.
+    /// The schema of `self` is extended with any new fields from `other`.
+    pub fn merge_from(&self, other: &Collection) {
+        assert_eq!(
+            self.config.dims, other.config.dims,
+            "cannot merge collections with different dimensions ({} vs {})",
+            self.config.dims, other.config.dims
+        );
+
+        // Merge schema: add any fields from other that self doesn't have yet.
+        {
+            let other_schema = other.schema.read().unwrap();
+            let mut self_schema = self.schema.write().unwrap();
+            for (name, ft) in other_schema.fields() {
+                // add_field returns false if already present — that's fine.
+                self_schema.add_field(name.clone(), *ft);
+            }
+        }
+
+        // Copy every document from other into self (upsert handles overwrite).
+        let other_pk_map = other.pk_map.read().unwrap();
+        let other_fields = other.fields.read().unwrap();
+
+        for (idx, pk) in other_pk_map.iter().enumerate() {
+            if pk.is_empty() {
+                continue;
+            }
+
+            // Get the vector via the dense HNSW index (external id = internal index).
+            let ext_id = idx as u64;
+            let vector = match other.index.get_vector(ext_id) {
+                Some(v) => v,
+                None => continue, // deleted node
+            };
+
+            let fields = other_fields.get(pk).cloned().unwrap_or_default();
+            self.upsert(pk, &vector, fields);
+        }
+    }
+
+    /// Create a new in-memory collection by merging multiple collections.
+    ///
+    /// Uses the configuration (dims, metric, hnsw_params) of the *first*
+    /// collection. All collections must share the same dimensionality and
+    /// metric. Later collections overwrite earlier ones on PK conflicts.
+    pub fn merge_indexes(collections: &[&Collection]) -> Collection {
+        assert!(
+            !collections.is_empty(),
+            "merge_indexes requires at least one collection"
+        );
+
+        let first = collections[0];
+
+        // Build a merged schema from all collections.
+        let mut merged_schema = first.schema.read().unwrap().clone();
+        for col in &collections[1..] {
+            assert_eq!(
+                first.config.dims, col.config.dims,
+                "cannot merge collections with different dimensions"
+            );
+            let other_schema = col.schema.read().unwrap();
+            for (name, ft) in other_schema.fields() {
+                merged_schema.add_field(name.clone(), *ft);
+            }
+        }
+
+        let config = CollectionConfig {
+            dims: first.config.dims,
+            metric: first.config.metric,
+            hnsw_params: first.config.hnsw_params.clone(),
+            schema: merged_schema,
+        };
+
+        let merged = Collection::new(config);
+
+        for col in collections {
+            merged.merge_from(col);
+        }
+
+        merged
+    }
+
     /// Map a string pk to a numeric ID. Assigns new IDs as needed.
     fn pk_to_id(&self, pk: &str) -> u64 {
         let mut pk_map = self.pk_map.write().unwrap();
@@ -1000,6 +1147,83 @@ impl Collection {
         let id = pk_map.len() as u64;
         pk_map.push(pk.to_string());
         id
+    }
+}
+
+impl Collection {
+    /// Whether the collection's index is trained and ready for search.
+    pub fn is_trained(&self) -> bool {
+        true
+    }
+
+    /// Get comprehensive diagnostic information about the collection.
+    pub fn diagnostics(&self) -> CollectionDiagnostics {
+        let hnsw_stats = self.index.detailed_stats();
+
+        let (storage_backend, disk_size) = match &self.storage {
+            Some(lock) => {
+                let s = lock.read().unwrap();
+                (s.backend_type().to_string(), s.disk_size())
+            }
+            None => ("none".to_string(), None),
+        };
+
+        let schema = self.schema.read().unwrap();
+        let schema_fields: Vec<(String, String)> = schema
+            .fields()
+            .iter()
+            .map(|(name, ft)| {
+                let type_str = match ft {
+                    FieldType::String => "string",
+                    FieldType::Filtered => "filtered",
+                    FieldType::Tags => "tags",
+                };
+                (name.clone(), type_str.to_string())
+            })
+            .collect();
+        let schema_field_count = schema.fields().len();
+        let schema_indexed_field_count = schema.indexed_fields().len();
+
+        let inv = self.inv_index.read().unwrap();
+        let indexed_field_count = inv.index.len();
+        let mut total_terms = 0usize;
+        let mut total_posting_entries = 0usize;
+        let mut max_posting_list_size = 0usize;
+
+        for value_map in inv.index.values() {
+            total_terms += value_map.len();
+            for ids in value_map.values() {
+                let size = ids.len();
+                total_posting_entries += size;
+                if size > max_posting_list_size {
+                    max_posting_list_size = size;
+                }
+            }
+        }
+
+        let avg_posting_list_size = if total_terms > 0 {
+            total_posting_entries as f64 / total_terms as f64
+        } else {
+            0.0
+        };
+
+        CollectionDiagnostics {
+            total_vectors: self.index.len(),
+            dimensions: self.config.dims,
+            metric: self.config.metric,
+            hnsw_stats,
+            storage_backend,
+            disk_size,
+            schema_field_count,
+            schema_indexed_field_count,
+            schema_fields,
+            inverted_index_stats: InvertedIndexStats {
+                indexed_field_count,
+                total_terms,
+                avg_posting_list_size,
+                max_posting_list_size,
+            },
+        }
     }
 }
 
@@ -1888,5 +2112,206 @@ mod tests {
                 assert!((p.score - s.score).abs() < 1e-6);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_from_basic() {
+        let dims = 4;
+        let config = || {
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema())
+        };
+
+        let col_a = Collection::new(config());
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+        col_a.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+
+        let col_b = Collection::new(config());
+        col_b.upsert("doc-3", &[0.0, 0.0, 1.0, 0.0], test_fields("c", "t2"));
+        col_b.upsert("doc-4", &[0.0, 0.0, 0.0, 1.0], test_fields("d", "t2"));
+
+        col_a.merge_from(&col_b);
+
+        assert_eq!(col_a.doc_count(), 4);
+        assert_eq!(col_a.fetch("doc-3").unwrap()["category"], "c");
+        assert_eq!(col_a.fetch("doc-4").unwrap()["tenant"], "t2");
+
+        // Search should find all docs
+        let results = col_a.search(&[0.0, 0.0, 1.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].pk, "doc-3");
+    }
+
+    #[test]
+    fn test_merge_from_overwrite() {
+        let dims = 4;
+        let config = || {
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema())
+        };
+
+        let col_a = Collection::new(config());
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("old", "t1"));
+
+        let col_b = Collection::new(config());
+        col_b.upsert("doc-1", &[0.0, 1.0, 0.0, 0.0], test_fields("new", "t2"));
+
+        col_a.merge_from(&col_b);
+
+        // Overwrite semantics: doc-1 should have the values from col_b
+        assert_eq!(col_a.doc_count(), 1);
+        let fields = col_a.fetch("doc-1").unwrap();
+        assert_eq!(fields["category"], "new");
+        assert_eq!(fields["tenant"], "t2");
+    }
+
+    #[test]
+    fn test_merge_from_updates_inverted_index() {
+        let dims = 4;
+        let config = || {
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema())
+        };
+
+        let col_a = Collection::new(config());
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+
+        let col_b = Collection::new(config());
+        col_b.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+        col_b.upsert("doc-3", &[0.0, 0.0, 1.0, 0.0], test_fields("b", "t2"));
+
+        col_a.merge_from(&col_b);
+
+        // Filter should find merged docs
+        let results = col_a
+            .search(&[0.5, 0.5, 0.5, 0.0], 10, Some("category = 'b'"))
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_from_schema_extension() {
+        let dims = 4;
+        let col_a = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(FieldSchema::new(vec![
+                    ("category".into(), FieldType::Filtered),
+                ])),
+        );
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], {
+            let mut f = HashMap::new();
+            f.insert("category".to_string(), "a".to_string());
+            f
+        });
+
+        let col_b = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(FieldSchema::new(vec![
+                    ("tenant".into(), FieldType::Filtered),
+                ])),
+        );
+        col_b.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], {
+            let mut f = HashMap::new();
+            f.insert("tenant".to_string(), "t1".to_string());
+            f
+        });
+
+        col_a.merge_from(&col_b);
+
+        assert_eq!(col_a.doc_count(), 2);
+        // The schema should now have both "category" and "tenant"
+        let f = col_a.fetch("doc-2").unwrap();
+        assert_eq!(f["tenant"], "t1");
+    }
+
+    #[test]
+    fn test_merge_indexes_static() {
+        let dims = 4;
+        let config = || {
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema())
+        };
+
+        let col_a = Collection::new(config());
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+        col_a.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+
+        let col_b = Collection::new(config());
+        col_b.upsert("doc-3", &[0.0, 0.0, 1.0, 0.0], test_fields("c", "t2"));
+
+        let col_c = Collection::new(config());
+        col_c.upsert("doc-4", &[0.0, 0.0, 0.0, 1.0], test_fields("d", "t2"));
+
+        let merged = Collection::merge_indexes(&[&col_a, &col_b, &col_c]);
+
+        assert_eq!(merged.doc_count(), 4);
+        assert_eq!(merged.fetch("doc-1").unwrap()["category"], "a");
+        assert_eq!(merged.fetch("doc-4").unwrap()["category"], "d");
+
+        // Search
+        let results = merged.search(&[1.0, 0.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].pk, "doc-1");
+
+        // Filter
+        let results = merged
+            .search(&[0.5, 0.5, 0.5, 0.5], 10, Some("tenant = 't2'"))
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_indexes_overwrite_order() {
+        let dims = 4;
+        let config = || {
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema())
+        };
+
+        let col_a = Collection::new(config());
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("first", "t1"));
+
+        let col_b = Collection::new(config());
+        col_b.upsert("doc-1", &[0.0, 1.0, 0.0, 0.0], test_fields("second", "t2"));
+
+        // col_b is later, so its version should win
+        let merged = Collection::merge_indexes(&[&col_a, &col_b]);
+
+        assert_eq!(merged.doc_count(), 1);
+        let f = merged.fetch("doc-1").unwrap();
+        assert_eq!(f["category"], "second");
+    }
+
+    #[test]
+    fn test_merge_from_empty() {
+        let dims = 4;
+        let config = || {
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema())
+        };
+
+        let col_a = Collection::new(config());
+        col_a.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+
+        let col_b = Collection::new(config());
+
+        // Merging empty collection should be a no-op
+        col_a.merge_from(&col_b);
+        assert_eq!(col_a.doc_count(), 1);
+
+        // Merging into empty collection should work
+        col_b.merge_from(&col_a);
+        assert_eq!(col_b.doc_count(), 1);
+        assert_eq!(col_b.fetch("doc-1").unwrap()["category"], "a");
     }
 }
