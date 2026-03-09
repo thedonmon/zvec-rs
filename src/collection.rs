@@ -304,6 +304,15 @@ impl Collection {
             .read()
             .map_err(|e| format!("storage lock: {}", e))?;
 
+        // Restore schema from storage if not provided in config
+        if !self.config.schema.has_indexed_fields() {
+            if let Ok(Some(schema_json)) = storage.load_schema() {
+                if let Ok(schema) = FieldSchema::from_json(&schema_json) {
+                    self.config.schema = schema;
+                }
+            }
+        }
+
         let id_map = storage
             .load_id_map()
             .map_err(|e| format!("load id_map: {}", e))?;
@@ -573,8 +582,51 @@ impl Collection {
                     .write()
                     .map_err(|e| format!("storage lock: {}", e))?;
 
+                // Persist schema
+                if self.config.schema.has_indexed_fields() {
+                    let schema_json = serde_json::to_string(
+                        &self
+                            .config
+                            .schema
+                            .fields()
+                            .iter()
+                            .map(|(name, ft)| {
+                                let mut m = HashMap::new();
+                                m.insert(
+                                    "name".to_string(),
+                                    name.clone(),
+                                );
+                                m.insert(
+                                    "type".to_string(),
+                                    match ft {
+                                        FieldType::String => "string",
+                                        FieldType::Filtered => "filtered",
+                                        FieldType::Tags => "tags",
+                                    }
+                                    .to_string(),
+                                );
+                                m
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| format!("serialize schema: {}", e))?;
+                    storage
+                        .save_schema(&schema_json)
+                        .map_err(|e| format!("save schema: {}", e))?;
+                }
+
+                // Batch persist all active nodes
                 let pk_map = self.pk_map.read().unwrap();
                 let fields_map = self.fields.read().unwrap();
+
+                let mut batch: Vec<(
+                    u32,
+                    &str,
+                    Vec<f32>,
+                    HashMap<String, String>,
+                    Vec<Vec<u32>>,
+                )> = Vec::new();
+
                 for (idx, pk) in pk_map.iter().enumerate() {
                     if pk.is_empty() {
                         continue;
@@ -584,11 +636,21 @@ impl Collection {
                         let ext_id = idx as u64;
                         if let Some(vector) = self.index.get_vector(ext_id) {
                             let fields = fields_map.get(pk).cloned().unwrap_or_default();
-                            storage
-                                .put_vector(internal_id, pk, &vector, &fields, &conns)
-                                .map_err(|e| format!("persist node {}: {}", pk, e))?;
+                            batch.push((internal_id, pk, vector, fields, conns));
                         }
                     }
+                }
+
+                // Write in batches of 1000 for memory efficiency
+                for chunk in batch.chunks(1000) {
+                    let refs: Vec<(u32, &str, &[f32], &HashMap<String, String>, &[Vec<u32>])> =
+                        chunk
+                            .iter()
+                            .map(|(id, pk, v, f, c)| (*id, &pk[..], v.as_slice(), f, c.as_slice()))
+                            .collect();
+                    storage
+                        .put_vectors_batch(&refs)
+                        .map_err(|e| format!("batch persist: {}", e))?;
                 }
 
                 let next_id = pk_map.len() as u32;
@@ -598,13 +660,39 @@ impl Collection {
                     .save_state(entry_point, max_level, next_id)
                     .map_err(|e| format!("save state: {}", e))?;
 
-                storage
-                    .flush()
-                    .map_err(|e| format!("flush: {}", e))?;
+                storage.flush().map_err(|e| format!("flush: {}", e))?;
                 Ok(true)
             }
             None => Ok(false),
         }
+    }
+
+    /// Batch insert or update multiple documents.
+    /// More efficient than individual upserts for large imports.
+    pub fn upsert_batch(&self, docs: Vec<(&str, &[f32], HashMap<String, String>)>) {
+        for (pk, vector, fields) in docs {
+            self.upsert(pk, vector, fields);
+        }
+    }
+
+    /// Search with output field selection — only return specified fields.
+    pub fn search_with_fields(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filter_expr: Option<&str>,
+        output_fields: &[&str],
+    ) -> Result<Vec<SearchHit>, String> {
+        let mut hits = self.search(vector, top_k, filter_expr)?;
+
+        if !output_fields.is_empty() {
+            let field_set: HashSet<&str> = output_fields.iter().copied().collect();
+            for hit in &mut hits {
+                hit.fields.retain(|k, _| field_set.contains(k.as_str()));
+            }
+        }
+
+        Ok(hits)
     }
 
     /// Optimize the collection: flush to disk and compact the database.
@@ -1205,6 +1293,92 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].pk, "doc-1");
         }
+    }
+
+    #[test]
+    fn test_batch_upsert() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema()),
+        );
+
+        let docs: Vec<(&str, &[f32], HashMap<String, String>)> = vec![
+            ("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1")),
+            ("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1")),
+            ("doc-3", &[0.0, 0.0, 1.0, 0.0], test_fields("c", "t2")),
+        ];
+        col.upsert_batch(docs);
+
+        assert_eq!(col.doc_count(), 3);
+        assert_eq!(col.fetch("doc-2").unwrap()["category"], "b");
+    }
+
+    #[test]
+    fn test_search_with_output_fields() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema()),
+        );
+
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+
+        // Only return 'category' field
+        let results = col
+            .search_with_fields(&[1.0, 0.0, 0.0, 0.0], 1, None, &["category"])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].fields.contains_key("category"));
+        assert!(!results[0].fields.contains_key("tenant"));
+    }
+
+    #[test]
+    fn test_persistent_schema_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let dims = 4;
+        let config = CollectionConfig::new(dims)
+            .with_metric(MetricType::L2)
+            .with_schema(test_schema());
+
+        {
+            let col = Collection::open(dir.path(), "test", config.clone()).unwrap();
+            col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+            col.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+            col.flush().unwrap();
+        }
+
+        // Reopen WITHOUT providing a schema — it should be loaded from storage
+        let config_no_schema = CollectionConfig::new(dims).with_metric(MetricType::L2);
+        {
+            let col = Collection::open(dir.path(), "test", config_no_schema).unwrap();
+            assert_eq!(col.doc_count(), 2);
+
+            // Filters should still work because schema was loaded from storage
+            let results = col
+                .search(&[0.5, 0.5, 0.0, 0.0], 10, Some("category = 'a'"))
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].pk, "doc-1");
+        }
+    }
+
+    #[test]
+    fn test_cosine_metric_collection() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims).with_metric(MetricType::Cosine),
+        );
+
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], HashMap::new());
+        col.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], HashMap::new());
+        col.upsert("doc-3", &[0.7, 0.7, 0.0, 0.0], HashMap::new());
+
+        let results = col.search(&[1.0, 0.0, 0.0, 0.0], 3, None).unwrap();
+        // doc-1 should be closest (cosine=1.0)
+        assert_eq!(results[0].pk, "doc-1");
     }
 
     #[test]

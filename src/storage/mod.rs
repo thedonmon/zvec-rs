@@ -302,6 +302,63 @@ impl Storage {
         Ok(map)
     }
 
+    /// Save the schema JSON string.
+    pub fn save_schema(&self, schema_json: &str) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let table = txn.open_table(STATE)?;
+            // Store schema as a u64-keyed entry won't work since STATE is &str->u64.
+            // Use METADATA table with a sentinel key instead.
+            drop(table);
+            let mut meta = txn.open_table(METADATA)?;
+            // Use internal_id u32::MAX as sentinel for schema storage
+            meta.insert(u32::MAX, schema_json)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Load the schema JSON string.
+    pub fn load_schema(&self) -> Result<Option<String>, StorageError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(METADATA)?;
+        match table.get(u32::MAX)? {
+            Some(v) => Ok(Some(v.value().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Store multiple vectors in a single transaction (batch).
+    pub fn put_vectors_batch(
+        &self,
+        items: &[(u32, &str, &[f32], &std::collections::HashMap<String, String>, &[Vec<u32>])],
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut vectors_table = txn.open_table(VECTORS)?;
+            let mut meta_table = txn.open_table(METADATA)?;
+            let mut id_table = txn.open_table(ID_MAP)?;
+            let mut conn_table = txn.open_table(CONNECTIONS)?;
+
+            for &(internal_id, external_id, vector, fields, connections) in items {
+                let vector_bytes = f32_slice_to_bytes(vector);
+                vectors_table.insert(internal_id, vector_bytes.as_slice())?;
+
+                let meta_json = serde_json::to_string(fields)?;
+                meta_table.insert(internal_id, meta_json.as_str())?;
+
+                id_table.insert(external_id, internal_id)?;
+
+                for (level, conns) in connections.iter().enumerate() {
+                    let conn_bytes = u32_slice_to_bytes(conns);
+                    conn_table.insert((internal_id, level as u8), conn_bytes.as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Flush all pending writes to disk.
     pub fn flush(&mut self) -> Result<(), StorageError> {
         // redb commits are durable by default, but we can compact

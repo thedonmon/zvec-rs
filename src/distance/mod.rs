@@ -106,8 +106,14 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Cosine similarity = dot(a, b) / (|a| * |b|).
+/// Dispatches to SIMD implementation when available.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { neon::cosine_similarity_neon(a, b) };
+    }
+    #[allow(unreachable_code)]
     scalar::cosine_similarity(a, b)
 }
 
