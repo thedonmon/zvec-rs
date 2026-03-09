@@ -161,6 +161,93 @@ impl InvertedIndex {
                     .cloned()
                     .unwrap_or_default()
             }
+            FilterExpr::Lt(field, value) => {
+                let mut result = HashSet::new();
+                if let Some(value_map) = self.index.get(field) {
+                    for (k, ids) in value_map {
+                        if k.as_str() < value.as_str() {
+                            result.extend(ids);
+                        }
+                    }
+                }
+                result
+            }
+            FilterExpr::Le(field, value) => {
+                let mut result = HashSet::new();
+                if let Some(value_map) = self.index.get(field) {
+                    for (k, ids) in value_map {
+                        if k.as_str() <= value.as_str() {
+                            result.extend(ids);
+                        }
+                    }
+                }
+                result
+            }
+            FilterExpr::Gt(field, value) => {
+                let mut result = HashSet::new();
+                if let Some(value_map) = self.index.get(field) {
+                    for (k, ids) in value_map {
+                        if k.as_str() > value.as_str() {
+                            result.extend(ids);
+                        }
+                    }
+                }
+                result
+            }
+            FilterExpr::Ge(field, value) => {
+                let mut result = HashSet::new();
+                if let Some(value_map) = self.index.get(field) {
+                    for (k, ids) in value_map {
+                        if k.as_str() >= value.as_str() {
+                            result.extend(ids);
+                        }
+                    }
+                }
+                result
+            }
+            FilterExpr::Like(field, pattern) => {
+                let mut result = HashSet::new();
+                if let Some(value_map) = self.index.get(field) {
+                    let starts = pattern.starts_with('%');
+                    let ends = pattern.ends_with('%');
+                    for (k, ids) in value_map {
+                        let matched = match (starts, ends) {
+                            (true, true) => {
+                                let inner = &pattern[1..pattern.len() - 1];
+                                k.contains(inner)
+                            }
+                            (true, false) => {
+                                let suffix = &pattern[1..];
+                                k.ends_with(suffix)
+                            }
+                            (false, true) => {
+                                let prefix = &pattern[..pattern.len() - 1];
+                                k.starts_with(prefix)
+                            }
+                            (false, false) => k == pattern,
+                        };
+                        if matched {
+                            result.extend(ids);
+                        }
+                    }
+                }
+                result
+            }
+            FilterExpr::IsNull(field) => {
+                // IDs that do NOT appear in any value for this field
+                let has_field: HashSet<u32> = self.index
+                    .get(field)
+                    .map(|vm| vm.values().flat_map(|ids| ids.iter().copied()).collect())
+                    .unwrap_or_default();
+                all_ids.difference(&has_field).copied().collect()
+            }
+            FilterExpr::IsNotNull(field) => {
+                // IDs that appear in at least one value for this field
+                self.index
+                    .get(field)
+                    .map(|vm| vm.values().flat_map(|ids| ids.iter().copied()).collect())
+                    .unwrap_or_default()
+            }
             FilterExpr::And(left, right) => {
                 let left_set = self.evaluate(left, all_ids);
                 let right_set = self.evaluate(right, all_ids);
@@ -241,6 +328,13 @@ pub struct SearchHit {
 // Collection
 // ---------------------------------------------------------------------------
 
+/// A search result grouped by a field value.
+#[derive(Debug, Clone)]
+pub struct GroupByResult {
+    pub group_key: String,
+    pub hits: Vec<SearchHit>,
+}
+
 /// A vector collection with HNSW index, metadata, inverted index, and field storage.
 ///
 /// Thread-safe: supports concurrent inserts and searches.
@@ -254,18 +348,22 @@ pub struct Collection {
     inv_index: RwLock<InvertedIndex>,
     /// Persistent storage (None = in-memory only)
     storage: Option<RwLock<Storage>>,
+    /// Mutable schema, separated from config for runtime mutations.
+    schema: RwLock<FieldSchema>,
     config: CollectionConfig,
 }
 
 impl Collection {
     /// Create a new in-memory collection (no persistence).
     pub fn new(config: CollectionConfig) -> Self {
+        let schema = config.schema.clone();
         Self {
             index: HnswIndex::new(config.dims, config.metric, config.hnsw_params.clone()),
             fields: RwLock::new(HashMap::new()),
             pk_map: RwLock::new(Vec::new()),
             inv_index: RwLock::new(InvertedIndex::new()),
             storage: None,
+            schema: RwLock::new(schema),
             config,
         }
     }
@@ -281,12 +379,14 @@ impl Collection {
         let storage =
             Storage::open(&db_path).map_err(|e| format!("failed to open storage: {}", e))?;
 
+        let schema = config.schema.clone();
         let mut collection = Self {
             index: HnswIndex::new(config.dims, config.metric, config.hnsw_params.clone()),
             fields: RwLock::new(HashMap::new()),
             pk_map: RwLock::new(Vec::new()),
             inv_index: RwLock::new(InvertedIndex::new()),
             storage: Some(RwLock::new(storage)),
+            schema: RwLock::new(schema),
             config,
         };
 
@@ -305,10 +405,10 @@ impl Collection {
             .map_err(|e| format!("storage lock: {}", e))?;
 
         // Restore schema from storage if not provided in config
-        if !self.config.schema.has_indexed_fields() {
+        if !self.schema.read().unwrap().has_indexed_fields() {
             if let Ok(Some(schema_json)) = storage.load_schema() {
                 if let Ok(schema) = FieldSchema::from_json(&schema_json) {
-                    self.config.schema = schema;
+                    *self.schema.write().unwrap() = schema;
                 }
             }
         }
@@ -369,7 +469,7 @@ impl Collection {
                 .map_err(|e| format!("load metadata {}: {}", internal_id, e))?
             {
                 // Rebuild inverted index from loaded metadata
-                inv_index.insert(*internal_id, &meta, &self.config.schema);
+                inv_index.insert(*internal_id, &meta, &self.schema.read().unwrap());
                 fields_map.insert(ext_id.clone(), meta);
             }
         }
@@ -396,7 +496,7 @@ impl Collection {
                     self.inv_index
                         .write()
                         .unwrap()
-                        .remove(pos as u32, old_fields, &self.config.schema);
+                        .remove(pos as u32, old_fields, &self.schema.read().unwrap());
                 }
             }
         }
@@ -409,7 +509,7 @@ impl Collection {
         self.inv_index
             .write()
             .unwrap()
-            .insert(numeric_id as u32, &fields, &self.config.schema);
+            .insert(numeric_id as u32, &fields, &self.schema.read().unwrap());
 
         self.fields
             .write()
@@ -445,7 +545,7 @@ impl Collection {
                         self.inv_index
                             .write()
                             .unwrap()
-                            .remove(id as u32, old_fields, &self.config.schema);
+                            .remove(id as u32, old_fields, &self.schema.read().unwrap());
                     }
                 }
 
@@ -583,36 +683,37 @@ impl Collection {
                     .map_err(|e| format!("storage lock: {}", e))?;
 
                 // Persist schema
-                if self.config.schema.has_indexed_fields() {
-                    let schema_json = serde_json::to_string(
-                        &self
-                            .config
-                            .schema
-                            .fields()
-                            .iter()
-                            .map(|(name, ft)| {
-                                let mut m = HashMap::new();
-                                m.insert(
-                                    "name".to_string(),
-                                    name.clone(),
-                                );
-                                m.insert(
-                                    "type".to_string(),
-                                    match ft {
-                                        FieldType::String => "string",
-                                        FieldType::Filtered => "filtered",
-                                        FieldType::Tags => "tags",
-                                    }
-                                    .to_string(),
-                                );
-                                m
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|e| format!("serialize schema: {}", e))?;
-                    storage
-                        .save_schema(&schema_json)
-                        .map_err(|e| format!("save schema: {}", e))?;
+                {
+                    let schema = self.schema.read().unwrap();
+                    if schema.has_indexed_fields() {
+                        let schema_json = serde_json::to_string(
+                            &schema
+                                .fields()
+                                .iter()
+                                .map(|(name, ft)| {
+                                    let mut m = HashMap::new();
+                                    m.insert(
+                                        "name".to_string(),
+                                        name.clone(),
+                                    );
+                                    m.insert(
+                                        "type".to_string(),
+                                        match ft {
+                                            FieldType::String => "string",
+                                            FieldType::Filtered => "filtered",
+                                            FieldType::Tags => "tags",
+                                        }
+                                        .to_string(),
+                                    );
+                                    m
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| format!("serialize schema: {}", e))?;
+                        storage
+                            .save_schema(&schema_json)
+                            .map_err(|e| format!("save schema: {}", e))?;
+                    }
                 }
 
                 // Batch persist all active nodes
@@ -708,6 +809,166 @@ impl Collection {
     /// Get collection configuration.
     pub fn config(&self) -> &CollectionConfig {
         &self.config
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupBy Search
+    // -----------------------------------------------------------------------
+
+    /// Search and group results by a field value.
+    ///
+    /// Returns up to `max_groups` groups, each with up to `top_k_per_group` hits.
+    /// Groups are sorted by the best score in each group.
+    pub fn group_by_search(
+        &self,
+        vector: &[f32],
+        group_field: &str,
+        max_groups: usize,
+        top_k_per_group: usize,
+        filter_expr: Option<&str>,
+    ) -> Result<Vec<GroupByResult>, String> {
+        // Over-fetch to have enough results for grouping.
+        let over_fetch = max_groups * top_k_per_group * 4;
+        let all_hits = self.search(vector, over_fetch, filter_expr)?;
+
+        // Group by the specified field.
+        let mut groups: HashMap<String, Vec<SearchHit>> = HashMap::new();
+        for hit in all_hits {
+            if let Some(key) = hit.fields.get(group_field) {
+                groups
+                    .entry(key.clone())
+                    .or_default()
+                    .push(hit);
+            }
+        }
+
+        // Truncate each group and collect.
+        let mut results: Vec<GroupByResult> = groups
+            .into_iter()
+            .map(|(key, mut hits)| {
+                hits.truncate(top_k_per_group);
+                GroupByResult {
+                    group_key: key,
+                    hits,
+                }
+            })
+            .collect();
+
+        // Sort groups by best score (first hit in each group, since search results are ordered).
+        let is_similarity = self.config.metric.is_similarity();
+        results.sort_by(|a, b| {
+            let score_a = a.hits.first().map(|h| h.score).unwrap_or(f32::NEG_INFINITY);
+            let score_b = b.hits.first().map(|h| h.score).unwrap_or(f32::NEG_INFINITY);
+            if is_similarity {
+                score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        });
+
+        results.truncate(max_groups);
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema Mutations
+    // -----------------------------------------------------------------------
+
+    /// Add a new field to the schema.
+    ///
+    /// If the new field is Filtered or Tags, rebuilds inverted index entries
+    /// for all existing documents that have a value for this field.
+    pub fn add_field(&self, name: &str, field_type: FieldType) -> Result<(), String> {
+        let mut schema = self.schema.write().unwrap();
+        if !schema.add_field(name.to_string(), field_type) {
+            return Err(format!("field '{}' already exists", name));
+        }
+
+        // If indexed, rebuild inverted index entries for existing docs.
+        if matches!(field_type, FieldType::Filtered | FieldType::Tags) {
+            let fields_map = self.fields.read().unwrap();
+            let pk_map = self.pk_map.read().unwrap();
+            let mut inv = self.inv_index.write().unwrap();
+
+            for (idx, pk) in pk_map.iter().enumerate() {
+                if pk.is_empty() {
+                    continue;
+                }
+                if let Some(doc_fields) = fields_map.get(pk) {
+                    if let Some(value) = doc_fields.get(name) {
+                        // Build a single-field map to reuse InvertedIndex::insert logic
+                        let single = {
+                            let mut m = HashMap::new();
+                            m.insert(name.to_string(), value.clone());
+                            m
+                        };
+                        inv.insert(idx as u32, &single, &schema);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a field from the schema and all documents.
+    ///
+    /// Removes the field from the schema, all document field maps,
+    /// and the inverted index.
+    pub fn drop_field(&self, name: &str) -> Result<(), String> {
+        let mut schema = self.schema.write().unwrap();
+        if !schema.remove_field(name) {
+            return Err(format!("field '{}' not found in schema", name));
+        }
+
+        // Remove from inverted index.
+        {
+            let mut inv = self.inv_index.write().unwrap();
+            inv.index.remove(name);
+        }
+
+        // Remove from all document field maps.
+        {
+            let mut fields_map = self.fields.write().unwrap();
+            for doc_fields in fields_map.values_mut() {
+                doc_fields.remove(name);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rename a field across the schema and all documents.
+    ///
+    /// Updates the schema, all document field maps, and the inverted index.
+    pub fn rename_field(&self, old_name: &str, new_name: &str) -> Result<(), String> {
+        let mut schema = self.schema.write().unwrap();
+        if !schema.rename_field(old_name, new_name) {
+            return Err(format!(
+                "cannot rename '{}' to '{}': source not found or target already exists",
+                old_name, new_name
+            ));
+        }
+
+        // Rename in inverted index.
+        {
+            let mut inv = self.inv_index.write().unwrap();
+            if let Some(entries) = inv.index.remove(old_name) {
+                inv.index.insert(new_name.to_string(), entries);
+            }
+        }
+
+        // Rename in all document field maps.
+        {
+            let mut fields_map = self.fields.write().unwrap();
+            for doc_fields in fields_map.values_mut() {
+                if let Some(value) = doc_fields.remove(old_name) {
+                    doc_fields.insert(new_name.to_string(), value);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Map a string pk to a numeric ID. Assigns new IDs as needed.
@@ -1385,5 +1646,190 @@ mod tests {
     fn test_flush_in_memory() {
         let col = Collection::new(CollectionConfig::new(3));
         assert_eq!(col.flush().unwrap(), false);
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupBy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_by_search() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema()),
+        );
+
+        // Insert docs in 3 categories with varying vectors.
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+        col.upsert("doc-2", &[0.9, 0.1, 0.0, 0.0], test_fields("a", "t1"));
+        col.upsert("doc-3", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+        col.upsert("doc-4", &[0.0, 0.9, 0.1, 0.0], test_fields("b", "t1"));
+        col.upsert("doc-5", &[0.0, 0.0, 1.0, 0.0], test_fields("c", "t1"));
+
+        let groups = col
+            .group_by_search(&[1.0, 0.0, 0.0, 0.0], "category", 3, 2, None)
+            .unwrap();
+
+        // Should have 3 groups.
+        assert_eq!(groups.len(), 3);
+
+        // Each group should have at most 2 hits.
+        for g in &groups {
+            assert!(g.hits.len() <= 2);
+            // All hits in a group should share the same category.
+            for hit in &g.hits {
+                assert_eq!(hit.fields["category"], g.group_key);
+            }
+        }
+
+        // First group should be "a" (closest to query [1,0,0,0]).
+        assert_eq!(groups[0].group_key, "a");
+    }
+
+    #[test]
+    fn test_group_by_with_filter() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema()),
+        );
+
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+        col.upsert("doc-2", &[0.9, 0.1, 0.0, 0.0], test_fields("a", "t2"));
+        col.upsert("doc-3", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+        col.upsert("doc-4", &[0.0, 0.0, 1.0, 0.0], test_fields("b", "t2"));
+
+        // Group by category but filter to tenant = 't1'.
+        let groups = col
+            .group_by_search(
+                &[0.5, 0.5, 0.5, 0.0],
+                "category",
+                10,
+                5,
+                Some("tenant = 't1'"),
+            )
+            .unwrap();
+
+        // Should only contain docs from t1.
+        assert_eq!(groups.len(), 2); // a and b
+        for g in &groups {
+            for hit in &g.hits {
+                assert_eq!(hit.fields["tenant"], "t1");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema mutation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_field() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(FieldSchema::new(vec![
+                    ("category".into(), FieldType::Filtered),
+                ])),
+        );
+
+        // Insert docs with a "priority" field that isn't in the schema yet.
+        let mut f1 = HashMap::new();
+        f1.insert("category".to_string(), "a".to_string());
+        f1.insert("priority".to_string(), "high".to_string());
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], f1);
+
+        let mut f2 = HashMap::new();
+        f2.insert("category".to_string(), "b".to_string());
+        f2.insert("priority".to_string(), "low".to_string());
+        col.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], f2);
+
+        // "priority" is not indexed yet, so filtering on it won't work via inverted index.
+        // Add the field as Filtered.
+        col.add_field("priority", FieldType::Filtered).unwrap();
+
+        // Now filtering on "priority" should work.
+        let results = col
+            .search(&[0.5, 0.5, 0.0, 0.0], 10, Some("priority = 'high'"))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pk, "doc-1");
+
+        // Adding duplicate should fail.
+        assert!(col.add_field("priority", FieldType::Filtered).is_err());
+    }
+
+    #[test]
+    fn test_drop_field() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema()),
+        );
+
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+        col.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+
+        // Drop the "category" field.
+        col.drop_field("category").unwrap();
+
+        // Field should be gone from documents.
+        let f = col.fetch("doc-1").unwrap();
+        assert!(!f.contains_key("category"));
+        assert!(f.contains_key("tenant")); // other fields preserved
+
+        // Filtering on dropped field should return empty (no inverted index entries).
+        let results = col
+            .search(&[0.5, 0.5, 0.0, 0.0], 10, Some("category = 'a'"))
+            .unwrap();
+        assert_eq!(results.len(), 0);
+
+        // Dropping non-existent field should fail.
+        assert!(col.drop_field("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_rename_field() {
+        let dims = 4;
+        let col = Collection::new(
+            CollectionConfig::new(dims)
+                .with_metric(MetricType::L2)
+                .with_schema(test_schema()),
+        );
+
+        col.upsert("doc-1", &[1.0, 0.0, 0.0, 0.0], test_fields("a", "t1"));
+        col.upsert("doc-2", &[0.0, 1.0, 0.0, 0.0], test_fields("b", "t1"));
+
+        // Rename "category" to "group".
+        col.rename_field("category", "group").unwrap();
+
+        // Old name should be gone, new name should have the value.
+        let f = col.fetch("doc-1").unwrap();
+        assert!(!f.contains_key("category"));
+        assert_eq!(f["group"], "a");
+
+        // Filtering on old name should yield nothing.
+        let results = col
+            .search(&[0.5, 0.5, 0.0, 0.0], 10, Some("category = 'a'"))
+            .unwrap();
+        assert_eq!(results.len(), 0);
+
+        // Filtering on new name should work.
+        let results = col
+            .search(&[0.5, 0.5, 0.0, 0.0], 10, Some("group = 'a'"))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pk, "doc-1");
+
+        // Renaming non-existent field should fail.
+        assert!(col.rename_field("nonexistent", "x").is_err());
+
+        // Renaming to existing field should fail.
+        assert!(col.rename_field("group", "tenant").is_err());
     }
 }

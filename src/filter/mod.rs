@@ -9,6 +9,28 @@ mod parser;
 
 pub use parser::{parse_filter, FilterExpr};
 
+/// Simple LIKE pattern matching with `%` wildcards.
+/// Supports: `%suffix`, `prefix%`, `%infix%`, and exact match (no `%`).
+fn like_match(value: &str, pattern: &str) -> bool {
+    let starts = pattern.starts_with('%');
+    let ends = pattern.ends_with('%');
+    match (starts, ends) {
+        (true, true) => {
+            let inner = &pattern[1..pattern.len() - 1];
+            value.contains(inner)
+        }
+        (true, false) => {
+            let suffix = &pattern[1..];
+            value.ends_with(suffix)
+        }
+        (false, true) => {
+            let prefix = &pattern[..pattern.len() - 1];
+            value.starts_with(prefix)
+        }
+        (false, false) => value == pattern,
+    }
+}
+
 /// Evaluate a filter expression against a set of fields.
 pub fn matches(
     expr: &FilterExpr,
@@ -21,6 +43,18 @@ pub fn matches(
         FilterExpr::Ne(field, value) => {
             fields.get(field).map_or(true, |v| v != value)
         }
+        FilterExpr::Lt(field, value) => {
+            fields.get(field).map_or(false, |v| v.as_str() < value.as_str())
+        }
+        FilterExpr::Le(field, value) => {
+            fields.get(field).map_or(false, |v| v.as_str() <= value.as_str())
+        }
+        FilterExpr::Gt(field, value) => {
+            fields.get(field).map_or(false, |v| v.as_str() > value.as_str())
+        }
+        FilterExpr::Ge(field, value) => {
+            fields.get(field).map_or(false, |v| v.as_str() >= value.as_str())
+        }
         FilterExpr::In(field, values) => {
             fields.get(field).map_or(false, |v| values.contains(v))
         }
@@ -30,6 +64,11 @@ pub fn matches(
                 v.split(',').any(|tag| tag.trim() == value)
             })
         }
+        FilterExpr::Like(field, pattern) => {
+            fields.get(field).map_or(false, |v| like_match(v, pattern))
+        }
+        FilterExpr::IsNull(field) => !fields.contains_key(field),
+        FilterExpr::IsNotNull(field) => fields.contains_key(field),
         FilterExpr::And(left, right) => {
             matches(left, fields) && matches(right, fields)
         }
@@ -118,6 +157,75 @@ mod tests {
             &expr,
             &fields(&[("category", "art"), ("tenant", "org-1")])
         ));
+    }
+
+    #[test]
+    fn test_lt() {
+        let expr = parse_filter("name < 'c'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "abc")])));
+        assert!(!matches(&expr, &fields(&[("name", "def")])));
+        assert!(!matches(&expr, &fields(&[])));
+    }
+
+    #[test]
+    fn test_le() {
+        let expr = parse_filter("name <= 'b'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "a")])));
+        assert!(matches(&expr, &fields(&[("name", "b")])));
+        assert!(!matches(&expr, &fields(&[("name", "c")])));
+    }
+
+    #[test]
+    fn test_gt() {
+        let expr = parse_filter("name > 'b'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "c")])));
+        assert!(!matches(&expr, &fields(&[("name", "a")])));
+        assert!(!matches(&expr, &fields(&[])));
+    }
+
+    #[test]
+    fn test_ge() {
+        let expr = parse_filter("name >= 'b'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "b")])));
+        assert!(matches(&expr, &fields(&[("name", "c")])));
+        assert!(!matches(&expr, &fields(&[("name", "a")])));
+    }
+
+    #[test]
+    fn test_like_prefix() {
+        let expr = parse_filter("name LIKE 'hello%'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "hello world")])));
+        assert!(!matches(&expr, &fields(&[("name", "say hello")])));
+    }
+
+    #[test]
+    fn test_like_suffix() {
+        let expr = parse_filter("name LIKE '%world'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "hello world")])));
+        assert!(!matches(&expr, &fields(&[("name", "world peace")])));
+    }
+
+    #[test]
+    fn test_like_infix() {
+        let expr = parse_filter("name LIKE '%llo wo%'").unwrap();
+        assert!(matches(&expr, &fields(&[("name", "hello world")])));
+        assert!(!matches(&expr, &fields(&[("name", "goodbye")])));
+    }
+
+    #[test]
+    fn test_is_null() {
+        let expr = parse_filter("email IS NULL").unwrap();
+        assert!(matches(&expr, &fields(&[])));
+        assert!(matches(&expr, &fields(&[("name", "bob")])));
+        assert!(!matches(&expr, &fields(&[("email", "bob@example.com")])));
+    }
+
+    #[test]
+    fn test_is_not_null() {
+        let expr = parse_filter("email IS NOT NULL").unwrap();
+        assert!(matches(&expr, &fields(&[("email", "bob@example.com")])));
+        assert!(!matches(&expr, &fields(&[])));
+        assert!(!matches(&expr, &fields(&[("name", "bob")])));
     }
 
     #[test]

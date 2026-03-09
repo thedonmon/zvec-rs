@@ -109,6 +109,12 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
 /// Dispatches to SIMD implementation when available.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { x86::cosine_similarity_avx2(a, b) };
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         return unsafe { neon::cosine_similarity_neon(a, b) };

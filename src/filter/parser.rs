@@ -16,8 +16,15 @@
 pub enum FilterExpr {
     Eq(String, String),
     Ne(String, String),
+    Lt(String, String),
+    Le(String, String),
+    Gt(String, String),
+    Ge(String, String),
     In(String, Vec<String>),
     Contains(String, String),
+    Like(String, String),
+    IsNull(String),
+    IsNotNull(String),
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
     Not(Box<FilterExpr>),
@@ -49,6 +56,10 @@ enum Token {
     StringLit(String),
     Eq,
     Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     LParen,
     RParen,
     Comma,
@@ -57,6 +68,9 @@ enum Token {
     Not,
     In,
     Contains,
+    Like,
+    Is,
+    Null,
     Eof,
 }
 
@@ -92,6 +106,22 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             }
             ',' => {
                 tokens.push(Token::Comma);
+                i += 1;
+            }
+            '<' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                tokens.push(Token::Le);
+                i += 2;
+            }
+            '<' => {
+                tokens.push(Token::Lt);
+                i += 1;
+            }
+            '>' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                tokens.push(Token::Ge);
+                i += 2;
+            }
+            '>' => {
+                tokens.push(Token::Gt);
                 i += 1;
             }
             '=' => {
@@ -131,6 +161,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "NOT" => tokens.push(Token::Not),
                     "IN" => tokens.push(Token::In),
                     "CONTAINS" => tokens.push(Token::Contains),
+                    "LIKE" => tokens.push(Token::Like),
+                    "IS" => tokens.push(Token::Is),
+                    "NULL" => tokens.push(Token::Null),
                     _ => tokens.push(Token::Ident(word)),
                 }
             }
@@ -246,6 +279,26 @@ impl Parser {
                 let value = self.expect_string()?;
                 Ok(FilterExpr::Ne(field, value))
             }
+            Token::Lt => {
+                self.advance();
+                let value = self.expect_string()?;
+                Ok(FilterExpr::Lt(field, value))
+            }
+            Token::Le => {
+                self.advance();
+                let value = self.expect_string()?;
+                Ok(FilterExpr::Le(field, value))
+            }
+            Token::Gt => {
+                self.advance();
+                let value = self.expect_string()?;
+                Ok(FilterExpr::Gt(field, value))
+            }
+            Token::Ge => {
+                self.advance();
+                let value = self.expect_string()?;
+                Ok(FilterExpr::Ge(field, value))
+            }
             Token::In => {
                 self.advance();
                 self.expect(&Token::LParen)?;
@@ -261,6 +314,23 @@ impl Parser {
                 self.advance();
                 let value = self.expect_string()?;
                 Ok(FilterExpr::Contains(field, value))
+            }
+            Token::Like => {
+                self.advance();
+                let value = self.expect_string()?;
+                Ok(FilterExpr::Like(field, value))
+            }
+            Token::Is => {
+                self.advance();
+                // IS NULL or IS NOT NULL
+                if matches!(self.peek(), Token::Not) {
+                    self.advance();
+                    self.expect(&Token::Null)?;
+                    Ok(FilterExpr::IsNotNull(field))
+                } else {
+                    self.expect(&Token::Null)?;
+                    Ok(FilterExpr::IsNull(field))
+                }
             }
             other => Err(ParseError {
                 message: format!("expected operator after field '{}', got {:?}", field, other),
@@ -366,6 +436,48 @@ mod tests {
         assert!(parse_filter("= 'bad'").is_err());
         assert!(parse_filter("field ??").is_err());
         assert!(parse_filter("field = ").is_err());
+    }
+
+    #[test]
+    fn test_parse_lt() {
+        let expr = parse_filter("age < '30'").unwrap();
+        assert_eq!(expr, FilterExpr::Lt("age".into(), "30".into()));
+    }
+
+    #[test]
+    fn test_parse_le() {
+        let expr = parse_filter("age <= '30'").unwrap();
+        assert_eq!(expr, FilterExpr::Le("age".into(), "30".into()));
+    }
+
+    #[test]
+    fn test_parse_gt() {
+        let expr = parse_filter("age > '30'").unwrap();
+        assert_eq!(expr, FilterExpr::Gt("age".into(), "30".into()));
+    }
+
+    #[test]
+    fn test_parse_ge() {
+        let expr = parse_filter("age >= '30'").unwrap();
+        assert_eq!(expr, FilterExpr::Ge("age".into(), "30".into()));
+    }
+
+    #[test]
+    fn test_parse_like() {
+        let expr = parse_filter("name LIKE '%smith%'").unwrap();
+        assert_eq!(expr, FilterExpr::Like("name".into(), "%smith%".into()));
+    }
+
+    #[test]
+    fn test_parse_is_null() {
+        let expr = parse_filter("email IS NULL").unwrap();
+        assert_eq!(expr, FilterExpr::IsNull("email".into()));
+    }
+
+    #[test]
+    fn test_parse_is_not_null() {
+        let expr = parse_filter("email IS NOT NULL").unwrap();
+        assert_eq!(expr, FilterExpr::IsNotNull("email".into()));
     }
 
     #[test]

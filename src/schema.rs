@@ -104,6 +104,43 @@ impl FieldSchema {
     pub fn fields(&self) -> &[(String, FieldType)] {
         &self.fields
     }
+
+    // --- Mutation methods ---
+
+    /// Add a new field to the schema.
+    /// Returns false if a field with the same name already exists.
+    pub fn add_field(&mut self, name: String, field_type: FieldType) -> bool {
+        if self.fields.iter().any(|(n, _)| n == &name) {
+            return false;
+        }
+        self.fields.push((name, field_type));
+        true
+    }
+
+    /// Remove a field from the schema by name.
+    /// Returns true if the field was found and removed.
+    pub fn remove_field(&mut self, name: &str) -> bool {
+        let len_before = self.fields.len();
+        self.fields.retain(|(n, _)| n != name);
+        self.fields.len() < len_before
+    }
+
+    /// Rename a field in the schema.
+    /// Returns true if the field was found and renamed.
+    /// Returns false if the old name doesn't exist or the new name already exists.
+    pub fn rename_field(&mut self, old: &str, new: &str) -> bool {
+        // Check new name doesn't already exist.
+        if self.fields.iter().any(|(n, _)| n == new) {
+            return false;
+        }
+        for (name, _) in &mut self.fields {
+            if name == old {
+                *name = new.to_string();
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Default for FieldSchema {
