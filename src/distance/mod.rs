@@ -27,13 +27,16 @@ pub enum MetricType {
     /// Cosine similarity. Higher = more similar.
     /// Normalizes vectors before computing dot product.
     Cosine,
+    /// Maximum Inner Product Search. Higher = more similar.
+    /// Uses inner product directly — equivalent to IP but with MIPS semantics.
+    MIPS,
 }
 
 impl MetricType {
     /// Returns true if higher scores mean more similar.
     #[inline]
     pub fn is_similarity(self) -> bool {
-        matches!(self, MetricType::IP | MetricType::Cosine)
+        matches!(self, MetricType::IP | MetricType::Cosine | MetricType::MIPS)
     }
 
     /// Compare two distances. Returns true if `a` is closer/better than `b`.
@@ -64,6 +67,7 @@ impl MetricType {
             MetricType::L2 => l2_squared(a, b),
             MetricType::IP => inner_product(a, b),
             MetricType::Cosine => cosine_similarity(a, b),
+            MetricType::MIPS => inner_product(a, b),
         }
     }
 }
@@ -198,6 +202,45 @@ mod tests {
         assert!(MetricType::L2.is_better(1.0, 2.0));
         assert!(MetricType::IP.is_better(2.0, 1.0));
         assert!(MetricType::Cosine.is_better(0.9, 0.5));
+    }
+
+    #[test]
+    fn test_mips_is_similarity() {
+        assert!(MetricType::MIPS.is_similarity());
+        assert!(MetricType::MIPS.is_better(2.0, 1.0));
+        assert!(!MetricType::MIPS.is_better(1.0, 2.0));
+        assert_eq!(MetricType::MIPS.worst_distance(), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_mips_distance() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        let mips_dist = MetricType::MIPS.distance(&a, &b);
+        let ip_dist = MetricType::IP.distance(&a, &b);
+        assert!((mips_dist - ip_dist).abs() < 1e-6, "MIPS should use inner product");
+        assert!((mips_dist - 32.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mips_search() {
+        use crate::hnsw::{HnswIndex, HnswParams};
+
+        let params = HnswParams::new(16, 100);
+        let index = HnswIndex::new(3, MetricType::MIPS, params);
+
+        // Insert vectors with varying inner products with query [1, 1, 1]
+        index.insert(1, &[0.1, 0.1, 0.1]); // IP = 0.3
+        index.insert(2, &[1.0, 1.0, 1.0]); // IP = 3.0
+        index.insert(3, &[0.5, 0.5, 0.5]); // IP = 1.5
+        index.insert(4, &[2.0, 2.0, 2.0]); // IP = 6.0
+
+        let query = vec![1.0, 1.0, 1.0];
+        let results = index.search(&query, 4);
+
+        // Highest IP should be first
+        assert_eq!(results[0].id, 4);
+        assert_eq!(results[1].id, 2);
     }
 
     #[test]

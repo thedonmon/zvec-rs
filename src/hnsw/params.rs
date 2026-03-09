@@ -22,6 +22,14 @@ pub struct HnswParams {
 
     /// Normalization factor for level generation: 1 / ln(M).
     pub(crate) ml: f64,
+
+    /// Use heuristic neighbor selection (Algorithm 4 from the paper).
+    /// Better recall at the cost of slightly slower inserts.
+    pub use_heuristic: bool,
+
+    /// Extend candidates by adding their neighbors during selection.
+    /// Only used when `use_heuristic` is true.
+    pub extend_candidates: bool,
 }
 
 impl HnswParams {
@@ -33,11 +41,23 @@ impl HnswParams {
             ef_construction,
             ef_search: 50,
             ml: 1.0 / (m as f64).ln(),
+            use_heuristic: true,
+            extend_candidates: false,
         }
     }
 
     pub fn with_ef_search(mut self, ef: usize) -> Self {
         self.ef_search = ef;
+        self
+    }
+
+    pub fn with_heuristic(mut self, use_heuristic: bool) -> Self {
+        self.use_heuristic = use_heuristic;
+        self
+    }
+
+    pub fn with_extend_candidates(mut self, extend: bool) -> Self {
+        self.extend_candidates = extend;
         self
     }
 }

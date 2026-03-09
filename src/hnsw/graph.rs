@@ -9,6 +9,43 @@ use super::params::HnswParams;
 use super::search::{Candidate, FarCandidate, SearchResult};
 use crate::distance::MetricType;
 
+/// Simple bloom filter for tracking visited nodes during search.
+/// Uses two hash functions for low false positive rate.
+struct BloomFilter {
+    bits: Vec<u64>,
+    n_bits: usize,
+}
+
+impl BloomFilter {
+    /// Create a bloom filter sized for `expected` elements with ~1% false positive rate.
+    fn new(expected: usize) -> Self {
+        let n_bits = (expected * 10).max(64); // ~10 bits per element for ~1% FPR
+        let n_words = (n_bits + 63) / 64;
+        Self {
+            bits: vec![0u64; n_words],
+            n_bits,
+        }
+    }
+
+    /// Insert an element. Returns true if it was already (possibly) present.
+    fn insert(&mut self, value: u32) -> bool {
+        let h1 = (value as usize).wrapping_mul(0x9E3779B97F4A7C15_u64 as usize) % self.n_bits;
+        let h2 = (value as usize).wrapping_mul(0x517CC1B727220A95_u64 as usize) % self.n_bits;
+        let was_set = self.get_bit(h1) && self.get_bit(h2);
+        self.set_bit(h1);
+        self.set_bit(h2);
+        was_set
+    }
+
+    fn get_bit(&self, pos: usize) -> bool {
+        self.bits[pos / 64] & (1u64 << (pos % 64)) != 0
+    }
+
+    fn set_bit(&mut self, pos: usize) {
+        self.bits[pos / 64] |= 1u64 << (pos % 64);
+    }
+}
+
 /// A node in the HNSW graph.
 ///
 /// Each node owns its vector and has per-layer connection lists protected
@@ -50,7 +87,7 @@ impl Node {
 
 /// Thread-safe node storage. Append-only (nodes are boxed so pointers
 /// are stable even as the vec grows). Protected by a single RwLock but
-/// reads only need a brief lock to get the node reference — the actual
+/// reads only need a brief lock to get the node reference -- the actual
 /// data access is lock-free through the Box indirection.
 struct NodeStore {
     /// Boxed nodes for pointer stability. The outer RwLock is held
@@ -100,7 +137,7 @@ impl NodeStore {
 ///   Connection lists use per-node RwLocks so searches never block each other.
 /// - **Writes (insert/remove)**: Fine-grained per-node locking. Multiple inserts
 ///   can proceed concurrently as long as they touch different nodes.
-/// - **Entry point & max level**: Atomics — no locking needed.
+/// - **Entry point & max level**: Atomics -- no locking needed.
 /// - **ID mapping**: RwLock-protected HashMap. Brief lock on each access.
 ///
 /// This design allows high-throughput concurrent search with minimal contention,
@@ -208,11 +245,21 @@ impl HnswIndex {
 
                 let neighbors = self.search_layer(nodes, vector, current_ep, self.params.ef_construction, lc);
 
-                let selected: Vec<u32> = neighbors
-                    .iter()
-                    .take(max_conn)
-                    .map(|c| c.id)
-                    .collect();
+                let selected: Vec<u32> = if self.params.use_heuristic {
+                    self.select_neighbors_heuristic(
+                        nodes,
+                        vector,
+                        &neighbors,
+                        max_conn,
+                        self.params.extend_candidates,
+                    )
+                } else {
+                    neighbors
+                        .iter()
+                        .take(max_conn)
+                        .map(|c| c.id)
+                        .collect()
+                };
 
                 // Set forward connections (our node -> neighbors)
                 {
@@ -227,27 +274,55 @@ impl HnswIndex {
                     neighbor_conns.push(internal_id);
 
                     if neighbor_conns.len() > max_conn {
-                        // Prune: keep the closest `max_conn` neighbors
-                        let neighbor_vec = &nodes[neighbor_id as usize].vector;
-                        let mut scored: Vec<(OrderedFloat<f32>, u32)> = neighbor_conns
-                            .iter()
-                            .filter(|&&id| (id as usize) < nodes.len())
-                            .map(|&id| {
-                                let dist = self.metric.distance(
-                                    neighbor_vec,
-                                    &nodes[id as usize].vector,
-                                );
-                                (OrderedFloat(dist), id)
-                            })
-                            .collect();
-
-                        if self.metric.is_similarity() {
-                            scored.sort_by(|a, b| b.0.cmp(&a.0));
+                        if self.params.use_heuristic {
+                            // Build candidate list from current connections
+                            let neighbor_vec = &nodes[neighbor_id as usize].vector;
+                            let mut candidates: Vec<Candidate> = neighbor_conns
+                                .iter()
+                                .filter(|&&id| (id as usize) < nodes.len())
+                                .map(|&id| {
+                                    let dist = self.metric.distance(
+                                        neighbor_vec,
+                                        &nodes[id as usize].vector,
+                                    );
+                                    Candidate::new(dist, id)
+                                })
+                                .collect();
+                            if self.metric.is_similarity() {
+                                candidates.sort_by(|a, b| b.distance.cmp(&a.distance));
+                            } else {
+                                candidates.sort_by(|a, b| a.distance.cmp(&b.distance));
+                            }
+                            *neighbor_conns = self.select_neighbors_heuristic(
+                                nodes,
+                                neighbor_vec,
+                                &candidates,
+                                max_conn,
+                                false,
+                            );
                         } else {
-                            scored.sort_by(|a, b| a.0.cmp(&b.0));
+                            // Simple pruning: keep the closest `max_conn` neighbors
+                            let neighbor_vec = &nodes[neighbor_id as usize].vector;
+                            let mut scored: Vec<(OrderedFloat<f32>, u32)> = neighbor_conns
+                                .iter()
+                                .filter(|&&id| (id as usize) < nodes.len())
+                                .map(|&id| {
+                                    let dist = self.metric.distance(
+                                        neighbor_vec,
+                                        &nodes[id as usize].vector,
+                                    );
+                                    (OrderedFloat(dist), id)
+                                })
+                                .collect();
+
+                            if self.metric.is_similarity() {
+                                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                            } else {
+                                scored.sort_by(|a, b| a.0.cmp(&b.0));
+                            }
+                            scored.truncate(max_conn);
+                            *neighbor_conns = scored.into_iter().map(|(_, id)| id).collect();
                         }
-                        scored.truncate(max_conn);
-                        *neighbor_conns = scored.into_iter().map(|(_, id)| id).collect();
                     }
                 }
 
@@ -393,6 +468,8 @@ impl HnswIndex {
     }
 
     /// Search a single layer with ef candidates, returning sorted results.
+    /// Uses a bloom filter for the visited set on large graphs (>= 1000 nodes)
+    /// for faster lookups, falling back to HashSet for small graphs.
     fn search_layer(
         &self,
         nodes: &[Box<Node>],
@@ -411,8 +488,23 @@ impl HnswIndex {
         let mut results = BinaryHeap::new();
         results.push(FarCandidate::new(entry_dist, entry));
 
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(entry);
+        let use_bloom = nodes.len() >= 1000;
+
+        // Visited tracking: bloom filter for large graphs, HashSet for small
+        let mut bloom = if use_bloom {
+            let mut bf = BloomFilter::new(ef * 4);
+            bf.insert(entry);
+            Some(bf)
+        } else {
+            None
+        };
+        let mut visited_set = if use_bloom {
+            None
+        } else {
+            let mut hs = std::collections::HashSet::new();
+            hs.insert(entry);
+            Some(hs)
+        };
 
         while let Some(closest) = candidates.pop() {
             let worst = results.peek().unwrap();
@@ -435,10 +527,16 @@ impl HnswIndex {
             };
 
             for neighbor_id in conns {
-                if visited.contains(&neighbor_id) {
+                // Check visited using either bloom filter or hash set
+                let already_visited = if let Some(ref mut bf) = bloom {
+                    bf.insert(neighbor_id)
+                } else {
+                    !visited_set.as_mut().unwrap().insert(neighbor_id)
+                };
+
+                if already_visited {
                     continue;
                 }
-                visited.insert(neighbor_id);
 
                 if (neighbor_id as usize) >= nodes.len() {
                     continue;
@@ -471,6 +569,95 @@ impl HnswIndex {
         }
 
         result_vec
+    }
+
+    /// Select neighbors using the heuristic from the HNSW paper (Algorithm 4).
+    /// Prefers diverse neighbors -- a candidate is only selected if it's closer
+    /// to the query than to any already-selected neighbor. This creates more
+    /// diverse connections and improves recall.
+    fn select_neighbors_heuristic(
+        &self,
+        nodes: &[Box<Node>],
+        query_vector: &[f32],
+        candidates: &[Candidate],
+        max_conn: usize,
+        extend_candidates: bool,
+    ) -> Vec<u32> {
+        // Build the working set from candidates
+        let mut working = Vec::with_capacity(candidates.len() * 2);
+        let mut seen = std::collections::HashSet::with_capacity(candidates.len() * 2);
+
+        for c in candidates {
+            if seen.insert(c.id) {
+                working.push(*c);
+            }
+        }
+
+        // Optionally extend by adding neighbors of candidates
+        if extend_candidates {
+            for c in candidates {
+                let node = &nodes[c.id as usize];
+                // Only look at layer 0 connections for extension
+                if !node.connections.is_empty() {
+                    let conns = node.connections[0].read();
+                    for &neighbor_id in conns.iter() {
+                        if (neighbor_id as usize) < nodes.len() && seen.insert(neighbor_id) {
+                            let dist = self
+                                .metric
+                                .distance(query_vector, &nodes[neighbor_id as usize].vector);
+                            working.push(Candidate::new(dist, neighbor_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by distance (best first)
+        if self.metric.is_similarity() {
+            working.sort_by(|a, b| b.distance.cmp(&a.distance));
+        } else {
+            working.sort_by(|a, b| a.distance.cmp(&b.distance));
+        }
+
+        // Greedy selection: pick candidate if it's closer to query than to
+        // any already-selected neighbor
+        let mut selected: Vec<u32> = Vec::with_capacity(max_conn);
+
+        for candidate in &working {
+            if selected.len() >= max_conn {
+                break;
+            }
+
+            let dist_to_query = candidate.distance.into_inner();
+            let candidate_vec = &nodes[candidate.id as usize].vector;
+
+            let is_diverse = selected.iter().all(|&sel_id| {
+                let dist_to_selected =
+                    self.metric.distance(candidate_vec, &nodes[sel_id as usize].vector);
+                // Candidate is diverse if it's closer to query than to this selected neighbor
+                self.metric.is_better(dist_to_query, dist_to_selected)
+            });
+
+            if is_diverse {
+                selected.push(candidate.id);
+            }
+        }
+
+        // If heuristic didn't fill up, add remaining candidates by distance
+        if selected.len() < max_conn {
+            let selected_set: std::collections::HashSet<u32> =
+                selected.iter().copied().collect();
+            for candidate in &working {
+                if selected.len() >= max_conn {
+                    break;
+                }
+                if !selected_set.contains(&candidate.id) {
+                    selected.push(candidate.id);
+                }
+            }
+        }
+
+        selected
     }
 
     fn random_level(&self) -> usize {
@@ -526,7 +713,7 @@ impl HnswIndex {
 
     /// Restore a node with pre-built connections (for loading from storage).
     ///
-    /// This bypasses the normal insert path — no neighbor search is performed.
+    /// This bypasses the normal insert path -- no neighbor search is performed.
     /// The caller is responsible for ensuring connections are consistent.
     /// Nodes must be restored in internal_id order (0, 1, 2, ...).
     pub fn restore_node(
@@ -770,7 +957,7 @@ mod tests {
                 for _ in 0..200 {
                     let query: Vec<f32> = (0..dims).map(|_| rng.gen()).collect();
                     let _results = idx.search(&query, 5);
-                    // Don't assert count — concurrent inserts may change it
+                    // Don't assert count -- concurrent inserts may change it
                 }
             }));
         }
@@ -827,8 +1014,132 @@ mod tests {
 
         let avg_recall = total_recall / num_queries as f64;
         assert!(
-            avg_recall > 0.85,
-            "Average recall@{k} = {avg_recall:.3}, expected > 0.85"
+            avg_recall > 0.90,
+            "Average recall@{k} = {avg_recall:.3}, expected > 0.90"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_selection_improves_recall() {
+        let dims = 64;
+        let n = 1000;
+        let k = 10;
+        let num_queries = 30;
+        let mut rng = rand::thread_rng();
+
+        // Generate shared dataset
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+
+        let queries: Vec<Vec<f32>> = (0..num_queries)
+            .map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+
+        // Compute ground truth
+        let ground_truths: Vec<std::collections::HashSet<u64>> = queries
+            .iter()
+            .map(|query| {
+                let mut dists: Vec<(f32, u64)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (crate::distance::l2_squared(query, v), i as u64))
+                    .collect();
+                dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                dists.iter().take(k).map(|(_, id)| *id).collect()
+            })
+            .collect();
+
+        // Build index WITHOUT heuristic
+        let index_simple = HnswIndex::new(
+            dims,
+            MetricType::L2,
+            HnswParams::new(32, 200)
+                .with_ef_search(100)
+                .with_heuristic(false),
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            index_simple.insert(i as u64, v);
+        }
+
+        // Build index WITH heuristic
+        let index_heuristic = HnswIndex::new(
+            dims,
+            MetricType::L2,
+            HnswParams::new(32, 200)
+                .with_ef_search(100)
+                .with_heuristic(true),
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            index_heuristic.insert(i as u64, v);
+        }
+
+        // Measure recall for both
+        let mut recall_simple = 0.0;
+        let mut recall_heuristic = 0.0;
+
+        for (qi, query) in queries.iter().enumerate() {
+            let gt = &ground_truths[qi];
+
+            let results_simple = index_simple.search(query, k);
+            let found_simple: std::collections::HashSet<u64> =
+                results_simple.iter().map(|r| r.id).collect();
+            recall_simple += gt.intersection(&found_simple).count() as f64 / k as f64;
+
+            let results_heuristic = index_heuristic.search(query, k);
+            let found_heuristic: std::collections::HashSet<u64> =
+                results_heuristic.iter().map(|r| r.id).collect();
+            recall_heuristic += gt.intersection(&found_heuristic).count() as f64 / k as f64;
+        }
+
+        recall_simple /= num_queries as f64;
+        recall_heuristic /= num_queries as f64;
+
+        // Heuristic should have equal or better recall
+        assert!(
+            recall_heuristic >= recall_simple - 0.05,
+            "Heuristic recall ({recall_heuristic:.3}) should be >= simple recall ({recall_simple:.3}) - 0.05"
+        );
+    }
+
+    #[test]
+    fn test_bloom_filter_basic() {
+        let mut bf = BloomFilter::new(100);
+
+        // Fresh filter should not contain anything
+        assert!(!bf.insert(42)); // not present before
+        assert!(bf.insert(42)); // now present
+
+        assert!(!bf.insert(99));
+        assert!(bf.insert(99));
+
+        // Re-check 42 still present
+        assert!(bf.insert(42));
+    }
+
+    #[test]
+    fn test_bloom_filter_false_positive_rate() {
+        let n = 10_000;
+        let mut bf = BloomFilter::new(n);
+
+        // Insert items 0..n
+        for i in 0..n as u32 {
+            bf.insert(i);
+        }
+
+        // Check items n..2n (none were inserted)
+        let mut false_positives = 0;
+        let m = 10_000;
+        for i in n as u32..(n + m) as u32 {
+            if bf.insert(i) {
+                false_positives += 1;
+            }
+        }
+
+        let fpr = false_positives as f64 / m as f64;
+        assert!(
+            fpr < 0.05,
+            "False positive rate {fpr:.4} exceeds 5% threshold"
         );
     }
 

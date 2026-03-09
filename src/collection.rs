@@ -776,6 +776,24 @@ impl Collection {
         }
     }
 
+    /// Search multiple queries in parallel using rayon.
+    /// Returns results for each query in the same order as the input queries.
+    pub fn parallel_search(
+        &self,
+        queries: &[Vec<f32>],
+        top_k: usize,
+        filter_expr: Option<&str>,
+    ) -> Result<Vec<Vec<SearchHit>>, String> {
+        use rayon::prelude::*;
+
+        let filter_str = filter_expr.map(|s| s.to_string());
+
+        queries
+            .par_iter()
+            .map(|q| self.search(q, top_k, filter_str.as_deref()))
+            .collect()
+    }
+
     /// Search with output field selection — only return specified fields.
     pub fn search_with_fields(
         &self,
@@ -1831,5 +1849,44 @@ mod tests {
 
         // Renaming to existing field should fail.
         assert!(col.rename_field("group", "tenant").is_err());
+    }
+
+    #[test]
+    fn test_parallel_search() {
+        let mut config = CollectionConfig::new(4);
+        config.metric = MetricType::L2;
+        let col = Collection::new(config);
+
+        // Insert some vectors.
+        let mut rng = rand::thread_rng();
+        for i in 0..50 {
+            let vec: Vec<f32> = (0..4).map(|_| rng.gen::<f32>()).collect();
+            col.upsert(&format!("doc{i}"), &vec, HashMap::new());
+        }
+
+        // Build 10 random queries.
+        let queries: Vec<Vec<f32>> = (0..10)
+            .map(|_| (0..4).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+
+        let top_k = 5;
+
+        // Run parallel search.
+        let parallel_results = col.parallel_search(&queries, top_k, None).unwrap();
+
+        // Run sequential search for comparison.
+        let sequential_results: Vec<Vec<SearchHit>> = queries
+            .iter()
+            .map(|q| col.search(q, top_k, None).unwrap())
+            .collect();
+
+        assert_eq!(parallel_results.len(), sequential_results.len());
+        for (par, seq) in parallel_results.iter().zip(sequential_results.iter()) {
+            assert_eq!(par.len(), seq.len());
+            for (p, s) in par.iter().zip(seq.iter()) {
+                assert_eq!(p.pk, s.pk);
+                assert!((p.score - s.score).abs() < 1e-6);
+            }
+        }
     }
 }

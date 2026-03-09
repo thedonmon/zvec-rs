@@ -5,6 +5,7 @@ pub enum QuantizationType {
     Fp16,
     Int8,
     Int4,
+    PQ,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +298,242 @@ impl Int4Vec {
 }
 
 // ---------------------------------------------------------------------------
+// K-means helper
+// ---------------------------------------------------------------------------
+
+/// Run k-means clustering on a set of vectors, returning `k` centroids.
+/// Uses random initialization and Lloyd's algorithm for `n_iters` iterations.
+fn kmeans(data: &[Vec<f32>], k: usize, n_iters: usize) -> Vec<Vec<f32>> {
+    use rand::Rng;
+
+    assert!(!data.is_empty(), "kmeans: data must not be empty");
+    assert!(k > 0, "kmeans: k must be positive");
+
+    let dim = data[0].len();
+    let k = k.min(data.len()); // can't have more centroids than data points
+
+    // Random initialization: pick k distinct data points
+    let mut rng = rand::thread_rng();
+    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
+    let mut used = std::collections::HashSet::new();
+    while centroids.len() < k {
+        let idx = rng.gen_range(0..data.len());
+        if used.insert(idx) {
+            centroids.push(data[idx].clone());
+        }
+    }
+
+    let mut assignments = vec![0usize; data.len()];
+
+    for _ in 0..n_iters {
+        // Assignment step: assign each vector to nearest centroid
+        for (i, vec) in data.iter().enumerate() {
+            let mut best_dist = f32::INFINITY;
+            let mut best_c = 0;
+            for (c, centroid) in centroids.iter().enumerate() {
+                let dist: f32 = vec
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_c = c;
+                }
+            }
+            assignments[i] = best_c;
+        }
+
+        // Update step: recompute centroids as mean of assigned vectors
+        let mut new_centroids = vec![vec![0.0f32; dim]; k];
+        let mut counts = vec![0usize; k];
+        for (i, vec) in data.iter().enumerate() {
+            let c = assignments[i];
+            counts[c] += 1;
+            for (j, &v) in vec.iter().enumerate() {
+                new_centroids[c][j] += v;
+            }
+        }
+        for c in 0..k {
+            if counts[c] > 0 {
+                for j in 0..dim {
+                    new_centroids[c][j] /= counts[c] as f32;
+                }
+            } else {
+                // Dead centroid: keep old value
+                new_centroids[c] = centroids[c].clone();
+            }
+        }
+        centroids = new_centroids;
+    }
+
+    centroids
+}
+
+// ---------------------------------------------------------------------------
+// Product Quantization
+// ---------------------------------------------------------------------------
+
+/// Product Quantization — splits vectors into sub-vectors and quantizes each independently.
+#[derive(Clone, Debug)]
+pub struct PqCodebook {
+    /// Number of sub-vectors
+    m: usize,
+    /// Dimension of each sub-vector (dims / m)
+    sub_dim: usize,
+    /// Number of centroids per sub-quantizer (typically 256 for 8-bit codes)
+    k: usize,
+    /// Centroids: m groups, each with k centroids of sub_dim dimensions.
+    /// Layout: centroids[sub_idx][centroid_idx] = Vec<f32> of length sub_dim
+    centroids: Vec<Vec<Vec<f32>>>,
+}
+
+/// A PQ-encoded vector (one byte per sub-vector).
+#[derive(Clone, Debug)]
+pub struct PqCode {
+    pub codes: Vec<u8>,
+}
+
+impl PqCodebook {
+    /// Train a PQ codebook using k-means on each sub-vector independently.
+    ///
+    /// # Arguments
+    /// * `vectors` - training vectors, each of length `dims`
+    /// * `dims` - dimensionality of the vectors
+    /// * `m` - number of sub-vectors to split into (dims must be divisible by m)
+    /// * `k` - number of centroids per sub-quantizer (max 256 for 8-bit codes)
+    /// * `n_iters` - number of k-means iterations
+    pub fn train(vectors: &[&[f32]], dims: usize, m: usize, k: usize, n_iters: usize) -> Self {
+        assert!(
+            dims % m == 0,
+            "dims ({}) must be divisible by m ({})",
+            dims,
+            m
+        );
+        assert!(k > 0 && k <= 256, "k must be in [1, 256]");
+        assert!(!vectors.is_empty(), "need at least one training vector");
+
+        let sub_dim = dims / m;
+        let mut centroids = Vec::with_capacity(m);
+
+        for sub_idx in 0..m {
+            // Extract sub-vectors for this partition
+            let start = sub_idx * sub_dim;
+            let end = start + sub_dim;
+            let sub_vectors: Vec<Vec<f32>> = vectors
+                .iter()
+                .map(|v| v[start..end].to_vec())
+                .collect();
+
+            // Run k-means on sub-vectors
+            let sub_centroids = kmeans(&sub_vectors, k, n_iters);
+            centroids.push(sub_centroids);
+        }
+
+        Self {
+            m,
+            sub_dim,
+            k,
+            centroids,
+        }
+    }
+
+    /// Encode a vector by finding the nearest centroid for each sub-vector.
+    pub fn encode(&self, vector: &[f32]) -> PqCode {
+        let mut codes = Vec::with_capacity(self.m);
+        for sub_idx in 0..self.m {
+            let start = sub_idx * self.sub_dim;
+            let end = start + self.sub_dim;
+            let sub_vec = &vector[start..end];
+
+            let mut best_dist = f32::INFINITY;
+            let mut best_c = 0u8;
+            for (c, centroid) in self.centroids[sub_idx].iter().enumerate() {
+                let dist: f32 = sub_vec
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_c = c as u8;
+                }
+            }
+            codes.push(best_c);
+        }
+        PqCode { codes }
+    }
+
+    /// Reconstruct an approximate vector by concatenating the centroids.
+    pub fn decode(&self, code: &PqCode) -> Vec<f32> {
+        let mut result = Vec::with_capacity(self.m * self.sub_dim);
+        for (sub_idx, &c) in code.codes.iter().enumerate() {
+            result.extend_from_slice(&self.centroids[sub_idx][c as usize]);
+        }
+        result
+    }
+
+    /// Compute approximate L2 distance using Asymmetric Distance Computation (ADC).
+    ///
+    /// Precomputes a distance table from the query sub-vectors to all centroids,
+    /// then sums up the appropriate entries using the code indices.
+    pub fn asymmetric_distance_l2(&self, query: &[f32], code: &PqCode) -> f32 {
+        let table = self.build_distance_table(query);
+        self.distance_with_table(&table, code)
+    }
+
+    /// Precompute the distance table for a query vector.
+    ///
+    /// Returns a table of shape [m][k] where table[i][j] is the squared L2
+    /// distance from query sub-vector i to centroid j of sub-quantizer i.
+    /// This table can be reused across many codes for efficient batch search.
+    pub fn build_distance_table(&self, query: &[f32]) -> Vec<Vec<f32>> {
+        let mut table = Vec::with_capacity(self.m);
+        for sub_idx in 0..self.m {
+            let start = sub_idx * self.sub_dim;
+            let end = start + self.sub_dim;
+            let sub_query = &query[start..end];
+
+            let mut dists = Vec::with_capacity(self.centroids[sub_idx].len());
+            for centroid in &self.centroids[sub_idx] {
+                let dist: f32 = sub_query
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                dists.push(dist);
+            }
+            table.push(dists);
+        }
+        table
+    }
+
+    /// Compute distance using a precomputed distance table.
+    pub fn distance_with_table(&self, table: &[Vec<f32>], code: &PqCode) -> f32 {
+        code.codes
+            .iter()
+            .enumerate()
+            .map(|(sub_idx, &c)| table[sub_idx][c as usize])
+            .sum()
+    }
+
+    /// Number of sub-vectors.
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Number of centroids per sub-quantizer.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Dimension of each sub-vector.
+    pub fn sub_dim(&self) -> usize {
+        self.sub_dim
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -490,5 +727,154 @@ mod tests {
         let qt2 = qt;
         assert_eq!(qt, qt2);
         let _s = format!("{:?}", qt);
+    }
+
+    // -- PQ -----------------------------------------------------------------
+
+    #[test]
+    fn test_pq_train_and_encode() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let dims = 16;
+        let n = 100;
+        let m = 4;
+        let k = 8;
+
+        let data: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+
+        let codebook = PqCodebook::train(&refs, dims, m, k, 20);
+        assert_eq!(codebook.m(), m);
+        assert_eq!(codebook.k(), k);
+        assert_eq!(codebook.sub_dim(), dims / m);
+
+        for vec in &data {
+            let code = codebook.encode(vec);
+            let reconstructed = codebook.decode(&code);
+            assert_eq!(reconstructed.len(), dims);
+
+            let error: f32 = vec
+                .iter()
+                .zip(reconstructed.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            assert!(error.is_finite(), "reconstruction error should be finite");
+        }
+    }
+
+    #[test]
+    fn test_pq_asymmetric_distance() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let dims = 8;
+        let n = 50;
+        let m = 2;
+        let k = 16;
+
+        let data: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+
+        let codebook = PqCodebook::train(&refs, dims, m, k, 20);
+
+        let query: Vec<f32> = (0..dims).map(|_| rng.gen::<f32>()).collect();
+        for vec in &data {
+            let code = codebook.encode(vec);
+            let adc_dist = codebook.asymmetric_distance_l2(&query, &code);
+            let reconstructed = codebook.decode(&code);
+            let true_dist: f32 = query
+                .iter()
+                .zip(reconstructed.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            assert!(
+                (adc_dist - true_dist).abs() < 1e-4,
+                "ADC ({}) should match L2 to reconstructed ({})",
+                adc_dist,
+                true_dist
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_distance_table() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let dims = 12;
+        let n = 30;
+        let m = 3;
+        let k = 8;
+
+        let data: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+
+        let codebook = PqCodebook::train(&refs, dims, m, k, 20);
+
+        let query: Vec<f32> = (0..dims).map(|_| rng.gen::<f32>()).collect();
+        let table = codebook.build_distance_table(&query);
+
+        for vec in &data {
+            let code = codebook.encode(vec);
+            let adc_dist = codebook.asymmetric_distance_l2(&query, &code);
+            let table_dist = codebook.distance_with_table(&table, &code);
+            assert!(
+                (adc_dist - table_dist).abs() < 1e-6,
+                "table dist ({}) should match ADC ({})",
+                table_dist,
+                adc_dist
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_small_dataset() {
+        let dims = 4;
+        let m = 2;
+        let k = 4;
+        let data: Vec<Vec<f32>> = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            vec![9.0, 10.0, 11.0, 12.0],
+        ];
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+
+        let codebook = PqCodebook::train(&refs, dims, m, k, 50);
+
+        for vec in &data {
+            let code = codebook.encode(vec);
+            let reconstructed = codebook.decode(&code);
+            let error: f32 = vec
+                .iter()
+                .zip(reconstructed.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            assert!(
+                error < 1e-4,
+                "with k >= n, reconstruction should be near-exact, got error {}",
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_code_length() {
+        let dims = 16;
+        let m = 4;
+        let k = 8;
+        let data: Vec<Vec<f32>> = vec![
+            vec![1.0; dims],
+            vec![2.0; dims],
+            vec![3.0; dims],
+        ];
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+
+        let codebook = PqCodebook::train(&refs, dims, m, k, 10);
+        let code = codebook.encode(&data[0]);
+        assert_eq!(code.codes.len(), m, "code length should equal m");
     }
 }
