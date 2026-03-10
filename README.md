@@ -16,6 +16,10 @@ High-performance embedded vector database in pure Rust. A feature-complete reimp
 - **Pluggable Storage** — `StorageBackend` trait with redb (persistent) and in-memory backends
 - **Clustering** — Standalone k-means, mini-batch k-means, and elbow method
 - **Collection API** — High-level API with upsert, search, delete-by-filter, group-by, merge, parallel search, and diagnostics
+- **AI Extension System** — Pluggable traits for dense/sparse embeddings and reranking with sync and async support
+  - Algorithmic rerankers: RRF, Weighted fusion (always available, zero dependencies)
+  - API clients: OpenAI, generic HTTP (feature-gated, works with Ollama, vLLM, HuggingFace TEI, LiteLLM, etc.)
+  - Async-first API clients behind `async` feature flag for tokio compatibility
 
 ## Quick Start
 
@@ -59,6 +63,110 @@ use zvec_rs::Query;
 let query = Query::parse("SELECT content, category WHERE tags CONTAINS 'physics' LIMIT 5")?;
 let result = collection.execute_query(&query, Some(&query_vector));
 ```
+
+## Embeddings & Reranking
+
+zvec-rs includes a pluggable extension system for AI-powered embeddings and reranking, mirroring the original zvec Python SDK.
+
+### Algorithmic Reranking (no dependencies)
+
+```rust
+use zvec_rs::{Collection, CollectionConfig, MetricType, HnswParams, RrfReranker, WeightedReranker};
+use std::collections::HashMap;
+
+let collection = Collection::new(config);
+// ... insert documents ...
+
+// Multi-vector search with RRF fusion
+let reranker = RrfReranker::with_top_n(10);
+let results = collection.search_with_reranker(
+    &[("dense", &dense_query), ("sparse", &sparse_query)],
+    50,     // fetch 50 candidates per query
+    None,   // no filter
+    &reranker,
+)?;
+
+// Weighted fusion with metric-aware normalization
+let mut weights = HashMap::new();
+weights.insert("dense".to_string(), 0.7);
+weights.insert("sparse".to_string(), 0.3);
+let reranker = WeightedReranker::new(10, MetricType::Cosine, weights);
+```
+
+### Text Search with Embeddings (feature-gated)
+
+```toml
+# Cargo.toml
+[dependencies]
+zvec-rs = { version = "0.1", features = ["openai"] }
+```
+
+```rust
+use zvec_rs::extension::OpenAiEmbedding;
+
+let embedder = OpenAiEmbedding::from_env(
+    "text-embedding-3-small".to_string(),
+    1536,
+)?;
+
+// Text-in, results-out
+let results = collection.search_text("quantum computing", &embedder, 10, None)?;
+
+// Text search + reranking
+let results = collection.search_text_with_reranker(
+    "quantum computing",
+    &embedder,
+    50,
+    Some("category = 'science'"),
+    &reranker,
+)?;
+```
+
+### Async API Clients (recommended for web services)
+
+```toml
+# Cargo.toml
+[dependencies]
+zvec-rs = { version = "0.1", features = ["openai", "async"] }
+```
+
+```rust
+use zvec_rs::extension::AsyncOpenAiEmbedding;
+
+let embedder = AsyncOpenAiEmbedding::from_env(
+    "text-embedding-3-small".to_string(),
+    1536,
+)?;
+
+let vector = embedder.embed("quantum computing").await?;
+let results = collection.search_text_async("quantum computing", &embedder, 10, None).await?;
+```
+
+### Custom Embedding Functions
+
+Implement the trait for any embedding source:
+
+```rust
+use zvec_rs::{DenseEmbeddingFunction, ExtensionError};
+
+struct MyLocalEmbedding { /* your model */ }
+
+impl DenseEmbeddingFunction for MyLocalEmbedding {
+    fn dimension(&self) -> usize { 384 }
+    fn embed(&self, input: &str) -> Result<Vec<f32>, ExtensionError> {
+        // Call your local model, ONNX runtime, etc.
+        todo!()
+    }
+}
+```
+
+### Feature Flags
+
+| Feature | What it enables |
+|---------|----------------|
+| `openai` | `OpenAiEmbedding` — sync client (blocking HTTP) |
+| `http-embedding` | `HttpEmbedding` — generic sync client for any OpenAI-compatible API |
+| `async` | Async traits + `AsyncOpenAiEmbedding`, `AsyncHttpEmbedding` |
 
 ## Persistence
 
@@ -109,6 +217,7 @@ zvec-rs/
     query.rs         — SQL query engine (SELECT, COUNT, GROUP BY)
     quantize.rs      — FP16, INT8, INT4, Product Quantization
     multi_vector.rs  — Result fusion (RRF, weighted sum, intersect, union)
+    extension/       — AI embedding + reranking traits, API clients (sync + async)
     cluster.rs       — k-means, mini-batch k-means, elbow method
     schema.rs        — Field schema (String, Filtered, Tags)
     sparse.rs        — Sparse vector type with dot/L2/cosine
@@ -121,7 +230,7 @@ zvec-rs/
 # Build
 cargo build --release
 
-# Run tests (241 tests)
+# Run tests (255 tests)
 cargo test
 
 # Run benchmarks with native SIMD

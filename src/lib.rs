@@ -1,6 +1,7 @@
 pub mod cluster;
 pub mod collection;
 pub mod distance;
+pub mod extension;
 pub mod filter;
 pub mod hnsw;
 pub mod ivf;
@@ -14,6 +15,12 @@ pub mod storage;
 pub use cluster::{elbow_method, kmeans, mini_batch_kmeans, KMeansResult};
 pub use collection::{Collection, CollectionConfig, CollectionDiagnostics, GroupByResult, InvertedIndexStats, SearchHit};
 pub use distance::MetricType;
+pub use extension::{
+    DenseEmbeddingFunction, ExtensionError, RerankInput, Reranker, RrfReranker,
+    SparseEmbeddingFunction, WeightedReranker,
+};
+#[cfg(feature = "async")]
+pub use extension::{AsyncDenseEmbeddingFunction, AsyncReranker, AsyncSparseEmbeddingFunction};
 pub use filter::{parse_filter, FilterExpr};
 pub use hnsw::{
     HnswDetailedStats, HnswIndex, HnswLevelStats, HnswParams, HnswStats, SearchResult,

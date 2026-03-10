@@ -1150,6 +1150,134 @@ impl Collection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Extension integration: embedding + reranking
+// ---------------------------------------------------------------------------
+
+impl Collection {
+    /// Search by text: embed the query using the provided embedding function,
+    /// then search the index.
+    ///
+    /// This is a convenience method that chains embedding → search.
+    ///
+    /// # Arguments
+    /// * `text` — the query text to embed
+    /// * `embedding_fn` — a [`DenseEmbeddingFunction`] implementation
+    /// * `top_k` — maximum number of results
+    /// * `filter_expr` — optional SQL-like filter expression
+    pub fn search_text(
+        &self,
+        text: &str,
+        embedding_fn: &dyn crate::extension::DenseEmbeddingFunction,
+        top_k: usize,
+        filter_expr: Option<&str>,
+    ) -> Result<Vec<SearchHit>, String> {
+        let vector = embedding_fn
+            .embed(text)
+            .map_err(|e| format!("embedding error: {e}"))?;
+        self.search(&vector, top_k, filter_expr)
+    }
+
+    /// Search with post-retrieval reranking.
+    ///
+    /// Runs one or more vector searches (keyed by name), then passes all
+    /// result lists to the reranker for fusion and re-scoring.
+    ///
+    /// # Arguments
+    /// * `queries` — named vector queries: `(name, vector)` pairs
+    /// * `top_k` — candidates to retrieve per query (before reranking)
+    /// * `filter_expr` — optional SQL-like filter expression
+    /// * `reranker` — a [`Reranker`] implementation
+    pub fn search_with_reranker(
+        &self,
+        queries: &[(&str, &[f32])],
+        top_k: usize,
+        filter_expr: Option<&str>,
+        reranker: &dyn crate::extension::Reranker,
+    ) -> Result<Vec<SearchHit>, String> {
+        let mut rerank_input = std::collections::HashMap::new();
+        for &(name, vector) in queries {
+            let hits = self.search(vector, top_k, filter_expr)?;
+            rerank_input.insert(name.to_string(), hits);
+        }
+        reranker
+            .rerank(&rerank_input)
+            .map_err(|e| format!("reranker error: {e}"))
+    }
+
+    /// Convenience: embed text, search, and rerank in one call.
+    ///
+    /// Combines `search_text` and `search_with_reranker` into a single
+    /// operation for the common case of text-in, reranked-results-out.
+    pub fn search_text_with_reranker(
+        &self,
+        text: &str,
+        embedding_fn: &dyn crate::extension::DenseEmbeddingFunction,
+        top_k: usize,
+        filter_expr: Option<&str>,
+        reranker: &dyn crate::extension::Reranker,
+    ) -> Result<Vec<SearchHit>, String> {
+        let vector = embedding_fn
+            .embed(text)
+            .map_err(|e| format!("embedding error: {e}"))?;
+        let hits = self.search(&vector, top_k, filter_expr)?;
+        let mut input = std::collections::HashMap::new();
+        input.insert("dense".to_string(), hits);
+        reranker
+            .rerank(&input)
+            .map_err(|e| format!("reranker error: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async extension integration
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+impl Collection {
+    /// Async version of [`search_text`](Collection::search_text).
+    ///
+    /// Uses an [`AsyncDenseEmbeddingFunction`] to embed the query, then
+    /// searches the index. The search itself is CPU-bound and runs synchronously.
+    pub async fn search_text_async(
+        &self,
+        text: &str,
+        embedding_fn: &dyn crate::extension::AsyncDenseEmbeddingFunction,
+        top_k: usize,
+        filter_expr: Option<&str>,
+    ) -> Result<Vec<SearchHit>, String> {
+        let vector = embedding_fn
+            .embed(text)
+            .await
+            .map_err(|e| format!("embedding error: {e}"))?;
+        self.search(&vector, top_k, filter_expr)
+    }
+
+    /// Async version of [`search_text_with_reranker`](Collection::search_text_with_reranker).
+    ///
+    /// Embeds the query async, searches, then reranks async.
+    pub async fn search_text_with_reranker_async(
+        &self,
+        text: &str,
+        embedding_fn: &dyn crate::extension::AsyncDenseEmbeddingFunction,
+        top_k: usize,
+        filter_expr: Option<&str>,
+        reranker: &dyn crate::extension::AsyncReranker,
+    ) -> Result<Vec<SearchHit>, String> {
+        let vector = embedding_fn
+            .embed(text)
+            .await
+            .map_err(|e| format!("embedding error: {e}"))?;
+        let hits = self.search(&vector, top_k, filter_expr)?;
+        let mut input = std::collections::HashMap::new();
+        input.insert("dense".to_string(), hits);
+        reranker
+            .rerank(&input)
+            .await
+            .map_err(|e| format!("reranker error: {e}"))
+    }
+}
+
 impl Collection {
     /// Whether the collection's index is trained and ready for search.
     pub fn is_trained(&self) -> bool {
@@ -2313,5 +2441,106 @@ mod tests {
         col_b.merge_from(&col_a);
         assert_eq!(col_b.doc_count(), 1);
         assert_eq!(col_b.fetch("doc-1").unwrap()["category"], "a");
+    }
+
+    // -----------------------------------------------------------------------
+    // Extension integration tests
+    // -----------------------------------------------------------------------
+
+    /// Mock embedding function that returns a fixed vector for any input.
+    struct MockEmbedding {
+        dim: usize,
+    }
+
+    impl crate::extension::DenseEmbeddingFunction for MockEmbedding {
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+        fn embed(&self, _input: &str) -> Result<Vec<f32>, crate::extension::ExtensionError> {
+            // Return a unit vector along dimension 0
+            let mut v = vec![0.0f32; self.dim];
+            v[0] = 1.0;
+            Ok(v)
+        }
+    }
+
+    #[test]
+    fn test_search_text() {
+        let config = CollectionConfig {
+            dims: 4,
+            metric: MetricType::Cosine,
+            hnsw_params: HnswParams::default(),
+            schema: FieldSchema::default(),
+        };
+        let col = Collection::new(config);
+
+        col.upsert("doc1", &[1.0, 0.0, 0.0, 0.0], HashMap::new());
+        col.upsert("doc2", &[0.0, 1.0, 0.0, 0.0], HashMap::new());
+
+        let embedder = MockEmbedding { dim: 4 };
+        let results = col.search_text("anything", &embedder, 2, None).unwrap();
+
+        assert!(!results.is_empty());
+        // The mock returns [1,0,0,0] so doc1 should be the best match
+        assert_eq!(results[0].pk, "doc1");
+    }
+
+    #[test]
+    fn test_search_with_reranker() {
+        let config = CollectionConfig {
+            dims: 4,
+            metric: MetricType::Cosine,
+            hnsw_params: HnswParams::default(),
+            schema: FieldSchema::default(),
+        };
+        let col = Collection::new(config);
+
+        col.upsert("doc1", &[1.0, 0.0, 0.0, 0.0], HashMap::new());
+        col.upsert("doc2", &[0.7, 0.7, 0.0, 0.0], HashMap::new());
+        col.upsert("doc3", &[0.0, 1.0, 0.0, 0.0], HashMap::new());
+
+        let query_a = [1.0f32, 0.0, 0.0, 0.0];
+        let query_b = [0.0f32, 1.0, 0.0, 0.0];
+
+        let reranker = crate::extension::RrfReranker::with_top_n(3);
+        let results = col
+            .search_with_reranker(
+                &[("dense", &query_a), ("sparse", &query_b)],
+                10,
+                None,
+                &reranker,
+            )
+            .unwrap();
+
+        // All 3 docs should appear (fused from both queries)
+        assert!(results.len() >= 2);
+        // Results should be sorted by RRF score (descending)
+        for w in results.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
+    }
+
+    #[test]
+    fn test_search_text_with_reranker() {
+        let config = CollectionConfig {
+            dims: 4,
+            metric: MetricType::Cosine,
+            hnsw_params: HnswParams::default(),
+            schema: FieldSchema::default(),
+        };
+        let col = Collection::new(config);
+
+        col.upsert("doc1", &[1.0, 0.0, 0.0, 0.0], HashMap::new());
+        col.upsert("doc2", &[0.0, 1.0, 0.0, 0.0], HashMap::new());
+
+        let embedder = MockEmbedding { dim: 4 };
+        let reranker = crate::extension::RrfReranker::with_top_n(1);
+
+        let results = col
+            .search_text_with_reranker("anything", &embedder, 10, None, &reranker)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pk, "doc1");
     }
 }
